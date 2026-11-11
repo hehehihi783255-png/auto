@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: denius-auto
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free                # Đổi sang 'starter' nếu muốn no-sleep
+    region: singapore         # Gần VN nhất — hoặc 'oregon'
+    healthCheckPath: /index.php?action=keepalive
+    autoDeploy: true
+    envVars:
+      - key: PHP_MEMORY_LIMIT
+        value: 256M
+      - key: TZ
+        value: Asia/Ho_Chi_Minh
