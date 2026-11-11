@@ -554,8 +554,7 @@ function denius_detectives(array $h, string $ttoanPred): array {
     // D5: MOMENTUM (3/5/10)
     $mom = []; foreach ([3,5,10] as $k) { $sl = array_slice($seq, -$k); $mom[$k] = count(array_filter($sl, fn($c) => $c === 'T')) / count($sl); }
     $trend = ($mom[3] > 0.5 && $mom[5] > 0.5 && $mom[10] > 0.5) ? 'T'
-           : ($mom[3] < 0.5 && $mom[5] < 0.5 && $mom[10] < 0.5) ? 'X' : null;
-    if ($trend === null) $v = 'CONFLICT'; elseif ($trend === $tSym) $v = 'FOLLOW'; else $v = 'SKIP';
+       : (($mom[3] < 0.5 && $mom[5] < 0.5 && $mom[10] < 0.5) ? 'X' : null); $v = 'CONFLICT'; elseif ($trend === $tSym) $v = 'FOLLOW'; else $v = 'SKIP';
     $votes['momentum'] = ['v'=>$v, 'note'=>'Xu hướng '.($trend ?? 'hỗn hợp')];
 
     // D6: ENTROPY
