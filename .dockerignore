@@ -1,0 +1,23 @@
+# Không copy data và file tạm vào image
+.data/
+.data/*
+*.log
+*.tmp
+*.lock
+
+# Git
+.git/
+.gitignore
+
+# Dev files
+.env
+.env.*
+*.md
+README*
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
