@@ -1,9 +1,11 @@
 <?php
 /**
- * DENIUS AUTO v8.0 — ALL-IN REVERSE
+ * DENIUS AUTO v8.1 — ALL-IN SMART BREAK
  * - Normal: prediction gốc + martingale vô hạn
- * - Thua 4 tay → ALL-IN: bẻ prediction + bet toàn bộ balance
- * - All-in thắng → REVERSE mode: bẻ + gấp thếp từ base, thua 1 tay → về normal
+ * - Thua 4 tay → ALL-IN:
+ *   • 10 phiên gần nhất: thắng > thua → all-in THEO tool (không bẻ)
+ *   • 10 phiên gần nhất: thua >= thắng → all-in BẺ (đảo prediction)
+ * - All-in thắng → REVERSE mode (bẻ + martingale), thua 1 → về normal
  * - All-in thua → dừng, reset
  */
 
@@ -16,7 +18,7 @@ $CFG = [
         'sessions_api' => 'https://wtx.tele68.com/v1/tx/sessions',
     ],
     'security' => [
-        'hmac_secret' => 'DENIUS_v8_ALLIN_REVERSE_HMAC',
+        'hmac_secret' => 'DENIUS_v81_ALLIN_SMART_HMAC',
         'session_ttl' => 2592000,
     ],
     'worker' => [
@@ -31,6 +33,7 @@ $CFG = [
         'auto'=>false, 'paused'=>false, 'lose_streak'=>0,
         'bet_streak'=>0,
         'allin_pending'=>false,
+        'allin_break'=>false,
         'reverse_mode'=>false,
         'onboarded'=>false,
     ],
@@ -738,16 +741,15 @@ function worker_step(string $key): array {
                     $reverseMode = !empty($c['reverse_mode']);
 
                     if ($allinPending) {
-                        // Đang xử lý kết quả của phiên ALL-IN
                         if ($win) {
-                            // All-in thắng → vào REVERSE mode
                             $c['allin_pending'] = false;
+                            $c['allin_break'] = false;
                             $c['reverse_mode'] = true;
                             $st = 0;
                             $bSt = 0;
                         } else {
-                            // All-in thua → dừng, reset
                             $c['allin_pending'] = false;
+                            $c['allin_break'] = false;
                             $c['reverse_mode'] = false;
                             $st = 0;
                             $bSt = 0;
@@ -755,26 +757,21 @@ function worker_step(string $key): array {
                             $c['paused'] = true;
                         }
                     } elseif ($reverseMode) {
-                        // Đang ở REVERSE mode
                         if ($win) {
-                            // Reverse thắng → tiếp tục reverse, reset bet_streak
                             $st = 0;
                             $bSt = 0;
                         } else {
-                            // Reverse thua → về NORMAL
                             $c['reverse_mode'] = false;
                             $st = 0;
                             $bSt = 0;
                         }
                     } else {
-                        // NORMAL mode
                         if ($win) {
                             $st = 0;
                             $bSt = 0;
                         } else {
                             $st++;
                             $bSt++;
-                            // Thua 4 tay → trigger all-in
                             if ($st >= 4) {
                                 $c['allin_pending'] = true;
                             }
@@ -869,29 +866,45 @@ function worker_step(string $key): array {
         $allinPending = !empty($cfg['allin_pending']);
         $reverseMode  = !empty($cfg['reverse_mode']);
 
-        // 🎯 RAW prediction từ engine
         $rawPred = denius_predict($R, $lossStreak);
 
         $baseBet = max(1000, (int)($cfg['base_bet'] ?? 10000));
         $bal = (int)($s['balance'] ?? 0);
 
-        // 🎲 DECIDE mode + pred + bet amount
+        $allinBreakFlag = false;
+
         if ($allinPending) {
-            // ALL-IN: bẻ + all-in toàn bộ
-            $finalPred = ($rawPred === 'T') ? 'X' : 'T';
+            // ═══ ALL-IN SMART ═══
+            // Đếm 10 phiên gần nhất
+            $recent = array_slice($s['history'] ?? [], 0, 10);
+            $w10 = 0; $l10 = 0;
+            foreach ($recent as $hh) {
+                if (!empty($hh['win'])) $w10++;
+                else $l10++;
+            }
+            $doBreak = ($l10 >= $w10); // thua >= thắng → bẻ
+
+            if ($doBreak) {
+                $finalPred = ($rawPred === 'T') ? 'X' : 'T';
+                $allinBreakFlag = true;
+            } else {
+                $finalPred = $rawPred; // theo tool
+                $allinBreakFlag = false;
+            }
+
             $betAmt = $bal;
             if ($betAmt < 1000) {
                 key_update($key, function($d) {
                     $d['config']['auto'] = false;
                     $d['config']['paused'] = true;
                     $d['config']['allin_pending'] = false;
+                    $d['config']['allin_break'] = false;
                     return $d;
                 });
-                key_log($key, 'error', '🛑 Không đủ vốn để ALL-IN (< 1.000đ) — Dừng auto');
+                key_log($key, 'error', '🛑 Không đủ vốn ALL-IN (< 1.000đ) — Dừng auto');
                 return $actions;
             }
         } elseif ($reverseMode) {
-            // REVERSE: bẻ + martingale
             $finalPred = ($rawPred === 'T') ? 'X' : 'T';
             $mult = 1;
             if ($betStreak > 0) {
@@ -905,7 +918,6 @@ function worker_step(string $key): array {
             if ($bal > 0 && $betAmt > $bal) $betAmt = $bal;
             if ($betAmt < 1000) $betAmt = 1000;
         } else {
-            // NORMAL: raw + martingale
             $finalPred = $rawPred;
             $mult = 1;
             if ($betStreak > 0) {
@@ -922,15 +934,21 @@ function worker_step(string $key): array {
 
         $predStr = ($finalPred === 'T') ? 'Tài' : 'Xỉu';
 
-        key_update($key, function($d) use ($predStr, $latestId, $betAmt) {
+        key_update($key, function($d) use ($predStr, $latestId, $betAmt, $allinBreakFlag) {
             $d['pending_pred'] = $predStr;
             $d['pending_session'] = $latestId + 1;
             $d['pending_bet_amount'] = $betAmt;
+            $d['config']['allin_break'] = $allinBreakFlag;
             return $d;
         });
+
         $modeStr = 'NORMAL';
-        if ($allinPending) $modeStr = 'ALL-IN';
-        elseif ($reverseMode) $modeStr = 'REVERSE';
+        if ($allinPending) {
+            if ($allinBreakFlag) $modeStr = 'ALL-IN-BREAK';
+            else $modeStr = 'ALL-IN-FOLLOW';
+        } elseif ($reverseMode) {
+            $modeStr = 'REVERSE';
+        }
         $log = "🎯 #" . ($latestId + 1) . " [$modeStr]: $predStr — " . number_format($betAmt) . "đ (bet_streak $betStreak)";
         key_log($key, 'info', $log);
         $actions[] = ['type'=>'predict', 'msg'=>$log];
@@ -1178,6 +1196,7 @@ try {
             $c['bet_streak'] = 0;
             $c['lose_streak'] = 0;
             $c['allin_pending'] = false;
+            $c['allin_break'] = false;
             $c['reverse_mode'] = false;
             $s['config'] = $c;
             key_save($key, $s);
@@ -1200,6 +1219,7 @@ try {
                 $d['config']['lose_streak'] = 0;
                 $d['config']['bet_streak'] = 0;
                 $d['config']['allin_pending'] = false;
+                $d['config']['allin_break'] = false;
                 $d['config']['reverse_mode'] = false;
                 $d['pending_pred'] = null;
                 $d['pending_session'] = null;
@@ -1286,7 +1306,7 @@ try {
 exit;
 
 // ═══════════════════════════════════════════════════════════════
-// UI — giữ nguyên v7 + badge mode
+// UI
 // ═══════════════════════════════════════════════════════════════
 function render_ui(): void { ?>
 <!DOCTYPE html>
@@ -1295,7 +1315,7 @@ function render_ui(): void { ?>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#05020f">
-<title>DENIUS · お兄ちゃん v8</title>
+<title>DENIUS · お兄ちゃん v8.1</title>
 <style>
 :root{
   --bg-0:#05020f;--bg-1:#0a0618;--bg-2:#120828;--bg-3:#1a0e35;
@@ -1540,7 +1560,7 @@ body{
 <div id="toast"></div>
 <script>
 const LOGO_URL = 'https://raw.githubusercontent.com/nguyenha783255-wq/LOGO-LC79/main/IMG_20260901_094944_094.jpg';
-const LS_KEY = 'denius_v8';
+const LS_KEY = 'denius_v81';
 const app = document.getElementById('app');
 const toastBox = document.getElementById('toast');
 
@@ -1548,7 +1568,7 @@ const S = {
   step: 'login', tab: 'main',
   user: '', nickname: '', balance: 0, authToken: '', device: '',
   loading: false, error: '',
-  config: {base_bet:0,profit_stop:0,auto:false,paused:false,lose_streak:0,bet_streak:0,allin_pending:false,reverse_mode:false},
+  config: {base_bet:0,profit_stop:0,auto:false,paused:false,lose_streak:0,bet_streak:0,allin_pending:false,allin_break:false,reverse_mode:false},
   history: [], stats: {wins:0,losses:0,total:0,winrate:0,profit:0},
   pendingPred: null, pendingSession: null, pendingBetAmount: null,
   workerAlive: false,
@@ -1716,7 +1736,10 @@ function getModeInfo() {
   const bs = S.config.bet_streak || 0;
   const mult = Math.min(bs, 20);
   if (S.config.allin_pending) {
-    return { text: '🔥 ALL-IN', color: 'var(--gold)' };
+    if (S.config.allin_break) {
+      return { text: '🔥 ALL-IN BẺ', color: 'var(--ruby)' };
+    }
+    return { text: '🔥 ALL-IN THEO', color: 'var(--gold)' };
   }
   if (S.config.reverse_mode) {
     return { text: '🔄 REVERSE x' + (1 << mult), color: 'var(--cyan)' };
@@ -1740,12 +1763,12 @@ function renderLogin() {
     '<div class="screen"><div class="login-wrap"><div class="login-card glass neon" style="position:relative">' +
       '<div class="logo-wrap"><img src="' + LOGO_URL + '" class="logo-img" onerror="this.style.display=\'none\'"></div>' +
       '<div class="brand-title">DENIUS</div>' +
-      '<div class="brand-sub"><span class="jp">お兄ちゃん</span> · ALL-IN REVERSE v8</div>' +
+      '<div class="brand-sub"><span class="jp">お兄ちゃん</span> · ALL-IN SMART v8.1</div>' +
       '<div class="field"><label>👤 TÀI KHOẢN</label><input id="in_u" type="text" placeholder="Nhập tài khoản..." value="' + esc(S.user) + '"></div>' +
       '<div class="field"><label>🔒 MẬT KHẨU</label><input id="in_p" type="password" placeholder="••••••••"></div>' +
       '<button class="btn btn-sakura" id="btn_login"' + (S.loading ? ' disabled' : '') + '>' + (S.loading ? 'ĐANG XÁC THỰC' : 'ĐĂNG NHẬP') + '</button>' +
       (S.error ? '<div class="msg err">⚠️ ' + esc(S.error) + '</div>' : '') +
-      '<div class="login-foot"><b>V8.0 ALL-IN REVERSE</b> · Admin <b>@DENIUS09</b></div>' +
+      '<div class="login-foot"><b>V8.1 ALL-IN SMART</b> · Admin <b>@DENIUS09</b></div>' +
     '</div></div></div>';
   const btn = document.getElementById('btn_login');
   btn.onclick = doLogin;
@@ -1831,7 +1854,7 @@ function renderBaseBet() {
       '<div class="field"><label>💰 SỐ VỐN (VNĐ)</label><input id="in_base" type="number" inputmode="numeric" value="' + val + '" min="1000" step="1000"></div>' +
       '<button class="btn btn-sakura" id="btn_next1">TIẾP TỤC →</button>' +
       (S.error ? '<div class="msg err">⚠️ ' + esc(S.error) + '</div>' : '') +
-      '<div class="setup-hint">💎 Gấp thếp X2 không giới hạn · Thua 4 → ALL-IN</div>' +
+      '<div class="setup-hint">💎 Gấp thếp X2 không giới hạn · Thua 4 → ALL-IN (theo/bẻ tùy 10 phiên)</div>' +
     '</div></div></div>';
   const inp = document.getElementById('in_base');
   inp.focus(); inp.select();
@@ -1860,7 +1883,7 @@ function renderTarget() {
       '<div class="field"><label>🎯 MỤC TIÊU (VNĐ)</label><input id="in_target" type="number" inputmode="numeric" value="' + val + '" min="10000" step="10000"></div>' +
       '<button class="btn btn-sakura" id="btn_start"' + (S.loading ? ' disabled' : '') + '>' + (S.loading ? 'ĐANG KHỞI ĐỘNG' : '🚀 BẮT ĐẦU AUTO') + '</button>' +
       (S.error ? '<div class="msg err">⚠️ ' + esc(S.error) + '</div>' : '') +
-      '<div class="setup-hint">⚙️ All-in sau 4 thua · Reverse mode sau thắng<br>💰 Vốn mỗi tay: <b>' + fmt(S.setupBaseBet) + 'đ</b></div>' +
+      '<div class="setup-hint">⚙️ All-in smart: thắng 10 > thua 10 → all theo tool, ngược lại → all bẻ<br>💰 Vốn mỗi tay: <b>' + fmt(S.setupBaseBet) + 'đ</b></div>' +
     '</div></div></div>';
   const inp = document.getElementById('in_target');
   inp.focus(); inp.select();
@@ -2087,6 +2110,7 @@ async function tick() {
       S.config.lose_streak = j.config.lose_streak;
       S.config.bet_streak = j.config.bet_streak;
       S.config.allin_pending = !!j.config.allin_pending;
+      S.config.allin_break = !!j.config.allin_break;
       S.config.reverse_mode = !!j.config.reverse_mode;
       S.config.base_bet = j.config.base_bet;
       S.config.profit_stop = j.config.profit_stop;
