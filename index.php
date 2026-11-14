@@ -1,10 +1,10 @@
 <?php
 /**
- * DENIUS AUTO v6.0 — REVERSE + FOLLOW + JACKPOT
- * - denius_predict gốc (V7.1) + caller đảo ngược
- * - Follow mode: thua 2 tay theo gốc, thắng tiếp tục, thua 2 lần về bẻ
- * - Martingale không giới hạn (cap bởi balance)
- * - Jackpot detection đa field + UI overlay
+ * DENIUS AUTO v7.0 — VIP PREDICTION ENGINE
+ * - denius_predict: engine VIP thực sự (4 markov, 6 pattern, 5 regime, adaptive threshold)
+ * - Bỏ hoàn toàn đảo ngược / follow mode
+ * - Martingale không giới hạn
+ * - Jackpot detection đa field + overlay
  */
 
 $CFG = [
@@ -16,7 +16,7 @@ $CFG = [
         'sessions_api' => 'https://wtx.tele68.com/v1/tx/sessions',
     ],
     'security' => [
-        'hmac_secret' => 'DENIUS_v6_REVERSE_FOLLOW_HMAC',
+        'hmac_secret' => 'DENIUS_v7_VIP_PREDICTION_HMAC',
         'session_ttl' => 2592000,
     ],
     'worker' => [
@@ -30,9 +30,6 @@ $CFG = [
         'mode'=>'double', 'max_lose_streak'=>4,
         'auto'=>false, 'paused'=>false, 'lose_streak'=>0,
         'bet_streak'=>0,
-        'follow_mode'=>false,
-        'follow_had_win'=>false,
-        'follow_losses'=>0,
         'onboarded'=>false,
     ],
     'max_history' => 500,
@@ -195,9 +192,8 @@ function fetch_sessions_api(): ?array {
     return $j;
 }
 
-// ═══════ JACKPOT DETECTION — đa field ═══════
+// ═══════ JACKPOT DETECTION ═══════
 function denius_detect_jackpot(array $found, array $dices): bool {
-    // Ưu tiên field từ server
     $fields = ['isJackpot', 'jackpot', 'isJackPot', 'isBaoLoc', 'baoloc', 'noHu', 'nohu',
                'jackpotResult', 'isJackpotResult', 'is_baoloc', 'is_jackpot'];
     foreach ($fields as $f) {
@@ -206,7 +202,6 @@ function denius_detect_jackpot(array $found, array $dices): bool {
             if ($v === true || $v === 1 || $v === '1' || $v === 'true') return true;
         }
     }
-    // Fallback: 3 xúc xắc cùng số (1-1-1 đến 6-6-6)
     if (count($dices) === 3) {
         $uniq = array_unique($dices);
         if (count($uniq) === 1 && $dices[0] >= 1 && $dices[0] <= 6) {
@@ -217,9 +212,10 @@ function denius_detect_jackpot(array $found, array $dices): bool {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 🧠 DENIUS PREDICT v6.0 — V7.1 core (KHÔNG ĐỔI)
+// 🧠 DENIUS PREDICT v7.0 — VIP ENGINE
+// 4 Markers / 6 Patterns / 5 Regimes / Adaptive Threshold
 // ═══════════════════════════════════════════════════════════════
-function _denius_flips(array $R, int $N): int {
+function _vip_flips(array $R, int $N): int {
     $n = count($R);
     if ($n < 2) return 0;
     $start = max(1, $n - $N + 1);
@@ -230,6 +226,103 @@ function _denius_flips(array $R, int $N): int {
     return $flips;
 }
 
+function _vip_runs(array $R): array {
+    $runs = [];
+    $n = count($R);
+    if ($n === 0) return $runs;
+    $cur = $R[0]; $len = 1;
+    for ($i = 1; $i < $n; $i++) {
+        if ($R[$i] === $cur) $len++;
+        else {
+            $runs[] = ['s'=>$cur, 'l'=>$len];
+            $cur = $R[$i];
+            $len = 1;
+        }
+    }
+    $runs[] = ['s'=>$cur, 'l'=>$len];
+    return $runs;
+}
+
+function _vip_pattern(array $runs): string {
+    $rn = count($runs);
+    if ($rn < 2) return '';
+    $lens = [];
+    foreach ($runs as $r) $lens[] = $r['l'];
+
+    $c11 = 0;
+    for ($i = 0; $i < $rn - 1; $i++) if ($lens[$i] === 1 && $lens[$i+1] === 1) $c11++;
+    if ($c11 >= 3) return '1-1';
+
+    $c22 = 0;
+    for ($i = 0; $i < $rn - 1; $i++) if ($lens[$i] === 2 && $lens[$i+1] === 2) $c22++;
+    if ($c22 >= 2) return '2-2';
+
+    $c33 = 0;
+    for ($i = 0; $i < $rn - 1; $i++) if ($lens[$i] === 3 && $lens[$i+1] === 3) $c33++;
+    if ($c33 >= 1) return '3-3';
+
+    $c12 = 0;
+    for ($i = 0; $i < $rn - 1; $i++) if ($lens[$i] === 1 && $lens[$i+1] === 2) $c12++;
+    if ($c12 >= 2) return '1-2';
+
+    $c21 = 0;
+    for ($i = 0; $i < $rn - 1; $i++) if ($lens[$i] === 2 && $lens[$i+1] === 1) $c21++;
+    if ($c21 >= 2) return '2-1';
+
+    $maxRun = 0;
+    foreach ($lens as $l) if ($l > $maxRun) $maxRun = $l;
+    if ($maxRun >= 5) return 'bet';
+
+    return '';
+}
+
+function _vip_markov(array $R, int $order): ?string {
+    $n = count($R);
+    if ($n < $order + 3) return null;
+    $ctx = '';
+    for ($i = $n - $order; $i < $n; $i++) $ctx .= $R[$i];
+    $t = 0; $x = 0;
+    for ($i = $order; $i < $n; $i++) {
+        $match = '';
+        for ($j = $i - $order; $j < $i; $j++) $match .= $R[$j];
+        if ($match === $ctx) {
+            if ($R[$i] === 'T') $t++;
+            else $x++;
+        }
+    }
+    $tot = $t + $x;
+    if ($tot < 2) return null;
+    $pt = ($t + 1) / ($tot + 2);
+    if (abs($pt - 0.5) < 0.1) return null;
+    return $pt > 0.5 ? 'T' : 'X';
+}
+
+function _vip_entropy(array $R, int $N): float {
+    $n = count($R);
+    if ($n === 0) return 1.0;
+    $window = ($n >= $N) ? array_slice($R, -$N) : $R;
+    $tc = 0;
+    foreach ($window as $r) if ($r === 'T') $tc++;
+    $p = $tc / count($window);
+    if ($p <= 0 || $p >= 1) return 0.0;
+    return -$p * log($p, 2) - (1-$p) * log(1-$p, 2);
+}
+
+function _vip_momentum(array $R, int $N): float {
+    $n = count($R);
+    if ($N > $n) $N = $n;
+    if ($N === 0) return 0.5;
+    $window = array_slice($R, -$N);
+    $tc = 0;
+    foreach ($window as $r) if ($r === 'T') $tc++;
+    return $tc / $N;
+}
+
+/**
+ * ═══ DENIUS PREDICT v7.0 VIP ═══
+ * Input: $R (mảng kết quả cũ → mới), $loss_streak
+ * Output: 'T' | 'X' — prediction chính thức, KHÔNG đảo
+ */
 function denius_predict(array $R, int $loss_streak = 0): string {
     $n = count($R);
     if ($n === 0) return 'T';
@@ -238,33 +331,207 @@ function denius_predict(array $R, int $loss_streak = 0): string {
     $last = $R[$n-1];
     $opp = ($last === 'T') ? 'X' : 'T';
 
-    // Survival
+    // ═══ SURVIVAL MODE ═══
+    // Đang thua >= 2 tay → bám tail, bảo toàn vốn
     if ($loss_streak >= 2) return $last;
 
-    // Features
+    // ═══ FEATURE EXTRACTION ═══
     $streak = 1;
     for ($i = $n - 2; $i >= 0; $i--) {
         if ($R[$i] === $last) $streak++;
         else break;
     }
-    $flips8 = _denius_flips($R, 8);
 
-    // Streak Shield
-    if ($streak >= 3) return $last;
+    $runs     = _vip_runs($R);
+    $rn       = count($runs);
+    $pattern  = _vip_pattern($runs);
+    $flips8   = _vip_flips($R, 8);
+    $flips15  = _vip_flips($R, 15);
+    $flips20  = _vip_flips($R, 20);
+    $markov1  = _vip_markov($R, 1);
+    $markov2  = _vip_markov($R, 2);
+    $markov3  = _vip_markov($R, 3);
+    $markov4  = _vip_markov($R, 4);
+    $ent20    = _vip_entropy($R, 20);
+    $mom3     = _vip_momentum($R, 3);
+    $mom5     = _vip_momentum($R, 5);
+    $mom10    = _vip_momentum($R, 10);
+    $bias20   = _vip_momentum($R, 20);
+    $bias30   = _vip_momentum($R, 30);
 
-    // Zigzag Hunter
-    if ($n >= 5 && $flips8 >= 4 && $streak <= 2) return $opp;
-
-    // Predictive Point
-    if ($n >= 4) {
-        if ($R[$n-1] === $R[$n-2] && $R[$n-2] !== $R[$n-3] && $R[$n-3] !== $R[$n-4]) return $last;
-        if ($R[$n-1] !== $R[$n-2] && $R[$n-2] === $R[$n-3] && $R[$n-3] === $R[$n-4]) return $last;
+    $avgRunLen = 0;
+    if ($rn > 0) {
+        $sum = 0;
+        foreach ($runs as $r) $sum += $r['l'];
+        $avgRunLen = $sum / $rn;
     }
 
-    // Chaos Guard
-    if ($n >= 10 && $flips8 >= 8) return $last;
+    // ═══ REGIME DETECTION ═══
+    $regime = 'normal';
+    if ($ent20 > 0.92) $regime = 'chaos';
+    elseif ($streak >= 6) $regime = 'long_streak';
+    elseif ($streak >= 3) $regime = 'short_streak';
+    elseif ($pattern === '1-1') $regime = 'alternating';
+    elseif ($pattern === '2-2') $regime = 'pair';
+    elseif ($pattern === '3-3') $regime = 'triple';
+    elseif ($bias20 >= 0.68 || $bias20 <= 0.32) $regime = 'biased';
 
-    // Default
+    // ═══ LAYER 1: STREAK SHIELD ═══
+    if ($streak >= 3) {
+        $rev = 0;
+        if ($streak >= 10) $rev += 4;
+        elseif ($streak >= 8) $rev += 3;
+        elseif ($streak >= 6) $rev += 2;
+        elseif ($streak >= 5) $rev += 1;
+
+        if ($last === 'T' && $bias20 >= 0.70) $rev += 2;
+        if ($last === 'X' && $bias20 <= 0.30) $rev += 2;
+        if ($markov2 !== null && $markov2 !== $last) $rev += 2;
+        if ($markov3 !== null && $markov3 !== $last) $rev += 1;
+        if ($ent20 > 0.90 && $streak >= 5) $rev += 1;
+
+        if ($rev >= 6) return $opp;
+        return $last;
+    }
+
+    // ═══ LAYER 2: ZIGZAG HUNTER ═══
+    if ($pattern === '1-1' && $flips8 >= 4) return $opp;
+
+    // ═══ LAYER 3: PREDICTIVE POINT ═══
+    if ($n >= 4) {
+        if ($R[$n-1] === $R[$n-2] && $R[$n-2] !== $R[$n-3] && $R[$n-3] !== $R[$n-4]) {
+            if ($streak === 2) {
+                if ($markov2 === $last || $markov1 === $last) return $last;
+                if ($flips8 >= 3) return $opp;
+            }
+        }
+        if ($R[$n-1] !== $R[$n-2] && $R[$n-2] === $R[$n-3] && $R[$n-3] === $R[$n-4]) {
+            if ($streak === 1) {
+                $prevLen = 0;
+                for ($i = $n - 2; $i >= 0; $i--) {
+                    if ($R[$i] === $R[$n-2]) $prevLen++;
+                    else break;
+                }
+                if ($prevLen >= 5) return $last;
+                if ($prevLen <= 4 && $markov1 === $R[$n-2]) return $R[$n-2];
+                return $last;
+            }
+        }
+    }
+
+    // ═══ LAYER 4: CHAOS GUARD ═══
+    if ($ent20 > 0.95 && $flips15 >= 8) {
+        if ($mom3 > 0.5) return 'T';
+        if ($mom3 < 0.5) return 'X';
+        return $last;
+    }
+
+    // ═══ LAYER 5: SIGNAL VOTING VIP ═══
+    $tScore = 0.0;
+    $xScore = 0.0;
+
+    // Baseline follow
+    if ($last === 'T') $tScore += 1.0;
+    else $xScore += 1.0;
+
+    // Markov 2/3/4
+    if ($markov2 !== null) {
+        if ($markov2 === 'T') $tScore += 2.0;
+        else $xScore += 2.0;
+    }
+    if ($markov3 !== null) {
+        if ($markov3 === 'T') $tScore += 1.5;
+        else $xScore += 1.5;
+    }
+    if ($markov4 !== null) {
+        if ($markov4 === 'T') $tScore += 1.0;
+        else $xScore += 1.0;
+    }
+
+    // Pattern
+    if ($pattern === '1-1') {
+        if ($opp === 'T') $tScore += 2.0;
+        else $xScore += 2.0;
+    } elseif ($pattern === '2-2' && $rn > 0) {
+        $curLen = $runs[$rn-1]['l'];
+        if ($curLen < 2) {
+            if ($last === 'T') $tScore += 1.5;
+            else $xScore += 1.5;
+        } else {
+            if ($opp === 'T') $tScore += 1.5;
+            else $xScore += 1.5;
+        }
+    } elseif ($pattern === '3-3' && $rn > 0) {
+        $curLen = $runs[$rn-1]['l'];
+        if ($curLen < 3) {
+            if ($last === 'T') $tScore += 1.5;
+            else $xScore += 1.5;
+        } else {
+            if ($opp === 'T') $tScore += 1.5;
+            else $xScore += 1.5;
+        }
+    } elseif ($pattern === 'bet') {
+        if ($last === 'T') $tScore += 1.5;
+        else $xScore += 1.5;
+    } elseif ($pattern === '1-2' || $pattern === '2-1') {
+        if ($rn > 1) {
+            $curLen = $runs[$rn-1]['l'];
+            $expected = ($runs[$rn-2]['l'] === 1) ? 2 : 1;
+            if ($curLen < $expected) {
+                if ($last === 'T') $tScore += 1.0;
+                else $xScore += 1.0;
+            } else {
+                if ($opp === 'T') $tScore += 1.0;
+                else $xScore += 1.0;
+            }
+        }
+    }
+
+    // Momentum multi-timeframe
+    $bullish = 0;
+    $bearish = 0;
+    if ($mom3 > 0.6) $bullish++;
+    elseif ($mom3 < 0.4) $bearish++;
+    if ($mom5 > 0.6) $bullish++;
+    elseif ($mom5 < 0.4) $bearish++;
+    if ($mom10 > 0.6) $bullish++;
+    elseif ($mom10 < 0.4) $bearish++;
+    if ($bullish >= 2 && $bearish === 0) $tScore += 1.5;
+    elseif ($bearish >= 2 && $bullish === 0) $xScore += 1.5;
+
+    // Bias reversion extreme
+    if ($bias20 > 0.68 && $bias30 > 0.63) $xScore += 2.0;
+    elseif ($bias20 < 0.32 && $bias30 < 0.37) $tScore += 2.0;
+
+    // Anti-streak
+    if ($flips20 >= 12 && $streak <= 2) {
+        if ($opp === 'T') $tScore += 1.0;
+        else $xScore += 1.0;
+    }
+
+    // Survival analysis
+    if ($avgRunLen > 0 && $streak > $avgRunLen + 1) {
+        if ($opp === 'T') $tScore += 1.0;
+        else $xScore += 1.0;
+    } elseif ($avgRunLen > 0 && $streak < $avgRunLen - 0.5) {
+        if ($last === 'T') $tScore += 0.5;
+        else $xScore += 0.5;
+    }
+
+    $total = $tScore + $xScore;
+    if ($total <= 0) return $last;
+
+    $majority = ($tScore > $xScore) ? 'T' : 'X';
+    $margin = abs($tScore - $xScore) / $total;
+
+    // Adaptive threshold theo regime
+    $threshold = 0.24;
+    if ($regime === 'chaos') $threshold = 0.35;
+    elseif ($regime === 'biased') $threshold = 0.20;
+    elseif ($regime === 'short_streak') $threshold = 0.30;
+    elseif ($regime === 'long_streak') $threshold = 0.28;
+
+    if ($majority !== $last && $margin >= $threshold) return $majority;
     return $last;
 }
 
@@ -509,49 +776,18 @@ function worker_step(string $key): array {
                     $c = $d['config'];
                     $st = (int)($c['lose_streak'] ?? 0);
                     $bSt = (int)($c['bet_streak'] ?? 0);
-                    $fm = !empty($c['follow_mode']);
-                    $fhw = !empty($c['follow_had_win']);
-                    $fl = (int)($c['follow_losses'] ?? 0);
 
                     if ($win) {
                         $st = 0;
                         $bSt = 0;
-                        if ($fm) {
-                            $fhw = true;
-                            $fl = 0;
-                        }
                         $d['win_count_total'] = (int)($d['win_count_total'] ?? 0) + 1;
                     } else {
                         $d['loss_count_total'] = (int)($d['loss_count_total'] ?? 0) + 1;
                         $st++;
                         $bSt++;
-                        if ($fm) {
-                            if ($fhw) {
-                                $fm = false;
-                                $fhw = false;
-                                $fl = 0;
-                                $st = 0;
-                            } else {
-                                $fl++;
-                                if ($fl >= 2) {
-                                    $fm = false;
-                                    $fl = 0;
-                                    $st = 0;
-                                }
-                            }
-                        } else {
-                            if ($st >= 2) {
-                                $fm = true;
-                                $fhw = false;
-                                $fl = 0;
-                            }
-                        }
                     }
                     $c['lose_streak'] = $st;
                     $c['bet_streak'] = $bSt;
-                    $c['follow_mode'] = $fm;
-                    $c['follow_had_win'] = $fhw;
-                    $c['follow_losses'] = $fl;
 
                     $betAmt = (int)($d['bet_amount'] ?? 0);
                     $bal = (int)($d['balance'] ?? 0);
@@ -570,7 +806,7 @@ function worker_step(string $key): array {
                         'ts'=>date('H:i:s d/m'),'session'=>$sid,'pred'=>$pred,'result'=>$result,
                         'dices'=>$dices,'tong'=>$tong,'win'=>$win,'amount'=>$betAmt,
                         'balance_after'=>$bal,'streak'=>$st,'bet_streak'=>$bSt,
-                        'follow_mode'=>$fm,'jackpot'=>$jackpot,
+                        'jackpot'=>$jackpot,
                     ]);
                     $d['history'] = array_slice($d['history'], 0, 500);
                     $d['pending_pred'] = null;
@@ -593,7 +829,7 @@ function worker_step(string $key): array {
                 });
                 $icon = $win ? '✅' : '❌';
                 $log = "$icon Phiên #$sid: $pred → $result (" . implode('-', $dices) . ")";
-                if ($jackpot) $log .= ' 🎉 NỔ HŨ!';
+                if ($jackpot) $log .= ' 🎰 NỔ HŨ!';
                 key_log($key, $win ? 'success' : 'error', $log);
                 $actions[] = ['type'=>'result', 'msg'=>$log];
                 $s = key_load($key);
@@ -632,18 +868,10 @@ function worker_step(string $key): array {
 
         $lossStreak = (int)($cfg['lose_streak'] ?? 0);
         $betStreak  = (int)($cfg['bet_streak'] ?? 0);
-        $followMode = !empty($cfg['follow_mode']);
 
-        // 🎯 PREDICTION: raw từ denius_predict
-        $rawPred = denius_predict($R, $lossStreak);
-        // Đảo ngược nếu NORMAL mode, giữ raw nếu FOLLOW mode
-        if ($followMode) {
-            $finalPred = $rawPred;
-        } else {
-            if ($rawPred === 'T') $finalPred = 'X';
-            else $finalPred = 'T';
-        }
-        $predStr = ($finalPred === 'T') ? 'Tài' : 'Xỉu';
+        // 🎯 PREDICTION CHÍNH THỨC — KHÔNG đảo
+        $predRaw = denius_predict($R, $lossStreak);
+        $predStr = ($predRaw === 'T') ? 'Tài' : 'Xỉu';
 
         // 🎲 BET AMOUNT: martingale không giới hạn (cap bởi balance)
         $baseBet = max(1000, (int)($cfg['base_bet'] ?? 10000));
@@ -667,8 +895,7 @@ function worker_step(string $key): array {
             $d['pending_bet_amount'] = $betAmt;
             return $d;
         });
-        $modeStr = $followMode ? 'FOLLOW' : 'REVERSE';
-        $log = "🎯 #" . ($latestId + 1) . " [$modeStr]: $predStr (raw $rawPred, bet_streak $betStreak) — " . number_format($betAmt) . 'đ';
+        $log = "🎯 #" . ($latestId + 1) . ": $predStr — " . number_format($betAmt) . "đ (bet_streak $betStreak)";
         key_log($key, 'info', $log);
         $actions[] = ['type'=>'predict', 'msg'=>$log];
         $s = key_load($key);
@@ -912,9 +1139,6 @@ try {
             $c['onboarded'] = true;
             $c['auto'] = true;
             $c['paused'] = false;
-            $c['follow_mode'] = false;
-            $c['follow_had_win'] = false;
-            $c['follow_losses'] = 0;
             $c['bet_streak'] = 0;
             $c['lose_streak'] = 0;
             $s['config'] = $c;
@@ -937,9 +1161,6 @@ try {
                 $d['config']['paused'] = true;
                 $d['config']['lose_streak'] = 0;
                 $d['config']['bet_streak'] = 0;
-                $d['config']['follow_mode'] = false;
-                $d['config']['follow_had_win'] = false;
-                $d['config']['follow_losses'] = 0;
                 $d['pending_pred'] = null;
                 $d['pending_session'] = null;
                 $d['pending_bet_amount'] = null;
@@ -1025,7 +1246,7 @@ try {
 exit;
 
 // ═══════════════════════════════════════════════════════════════
-// UI — JACKPOT OVERLAY + SUPER EFFECTS
+// UI — VIP EFFECTS
 // ═══════════════════════════════════════════════════════════════
 function render_ui(): void { ?>
 <!DOCTYPE html>
@@ -1034,7 +1255,7 @@ function render_ui(): void { ?>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#05020f">
-<title>DENIUS · お兄ちゃん v6</title>
+<title>DENIUS · お兄ちゃん v7</title>
 <style>
 :root{
   --bg-0:#05020f;--bg-1:#0a0618;--bg-2:#120828;--bg-3:#1a0e35;
@@ -1235,7 +1456,6 @@ body{
 .sparkle{position:fixed;width:5px;height:5px;border-radius:50%;pointer-events:none;z-index:9998;animation:sparkleAnim 0.9s ease-out forwards;box-shadow:0 0 10px currentColor,0 0 20px currentColor}
 @keyframes sparkleAnim{0%{transform:translate(0,0) scale(1);opacity:1}100%{transform:translate(var(--dx),var(--dy)) scale(0);opacity:0}}
 
-/* ═══ JACKPOT OVERLAY ═══ */
 .jackpot-overlay{position:fixed;inset:0;z-index:99999;display:none;align-items:center;justify-content:center;background:radial-gradient(circle at center,rgba(255,215,0,0.55),rgba(20,10,40,0.96) 70%);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);overflow:hidden}
 .jackpot-overlay.show{display:flex;animation:jackpotFadeIn 0.4s ease-out}
 @keyframes jackpotFadeIn{from{opacity:0}to{opacity:1}}
@@ -1245,7 +1465,7 @@ body{
 @keyframes jackpotPop{0%{transform:scale(0.3) rotate(-15deg);opacity:0}70%{transform:scale(1.1) rotate(5deg)}100%{transform:scale(1) rotate(0);opacity:1}}
 .jackpot-icon{font-size:80px;margin-bottom:20px;filter:drop-shadow(0 0 40px #ffd966);animation:jackpotBounce 1s ease-in-out infinite}
 @keyframes jackpotBounce{0%,100%{transform:translateY(0) scale(1)}50%{transform:translateY(-15px) scale(1.08)}}
-.jackpot-text{font-size:64px;font-weight:900;letter-spacing:8px;background:linear-gradient(90deg,#fff,#ffd966,#fff,#ffb300,#fff);background-size:300% 100%;-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;text-shadow:none;filter:drop-shadow(0 0 40px rgba(255,217,102,0.9));animation:jackpotShimmer 2s linear infinite;margin-bottom:8px;line-height:1}
+.jackpot-text{font-size:64px;font-weight:900;letter-spacing:8px;background:linear-gradient(90deg,#fff,#ffd966,#fff,#ffb300,#fff);background-size:300% 100%;-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;filter:drop-shadow(0 0 40px rgba(255,217,102,0.9));animation:jackpotShimmer 2s linear infinite;margin-bottom:8px;line-height:1}
 @keyframes jackpotShimmer{to{background-position:300% 0}}
 .jackpot-sub{font-size:20px;font-weight:900;letter-spacing:8px;color:#ffe89a;margin-bottom:20px;text-shadow:0 0 20px rgba(255,217,102,0.8)}
 .jackpot-detail{font-size:14px;color:#ffd966;font-family:"SF Mono",monospace;line-height:1.6;background:rgba(255,215,0,0.12);padding:14px 24px;border-radius:12px;border:1px solid rgba(255,215,0,0.4);display:inline-block;box-shadow:0 0 30px rgba(255,215,0,0.3)}
@@ -1280,7 +1500,7 @@ body{
 <div id="toast"></div>
 <script>
 const LOGO_URL = 'https://raw.githubusercontent.com/nguyenha783255-wq/LOGO-LC79/main/IMG_20260901_094944_094.jpg';
-const LS_KEY = 'denius_v6';
+const LS_KEY = 'denius_v7';
 const app = document.getElementById('app');
 const toastBox = document.getElementById('toast');
 
@@ -1288,7 +1508,7 @@ const S = {
   step: 'login', tab: 'main',
   user: '', nickname: '', balance: 0, authToken: '', device: '',
   loading: false, error: '',
-  config: {base_bet:0,profit_stop:0,auto:false,paused:false,lose_streak:0,bet_streak:0,follow_mode:false},
+  config: {base_bet:0,profit_stop:0,auto:false,paused:false,lose_streak:0,bet_streak:0},
   history: [], stats: {wins:0,losses:0,total:0,winrate:0,profit:0},
   pendingPred: null, pendingSession: null, pendingBetAmount: null,
   workerAlive: false,
@@ -1468,12 +1688,12 @@ function renderLogin() {
     '<div class="screen"><div class="login-wrap"><div class="login-card glass neon" style="position:relative">' +
       '<div class="logo-wrap"><img src="' + LOGO_URL + '" class="logo-img" onerror="this.style.display=\'none\'"></div>' +
       '<div class="brand-title">DENIUS</div>' +
-      '<div class="brand-sub"><span class="jp">お兄ちゃん</span> · SUPREME v6</div>' +
+      '<div class="brand-sub"><span class="jp">お兄ちゃん</span> · VIP PREDICTION v7</div>' +
       '<div class="field"><label>👤 TÀI KHOẢN</label><input id="in_u" type="text" placeholder="Nhập tài khoản..." value="' + esc(S.user) + '"></div>' +
       '<div class="field"><label>🔒 MẬT KHẨU</label><input id="in_p" type="password" placeholder="••••••••"></div>' +
       '<button class="btn btn-sakura" id="btn_login"' + (S.loading ? ' disabled' : '') + '>' + (S.loading ? 'ĐANG XÁC THỰC' : 'ĐĂNG NHẬP') + '</button>' +
       (S.error ? '<div class="msg err">⚠️ ' + esc(S.error) + '</div>' : '') +
-      '<div class="login-foot"><b>V6.0 REVERSE+FOLLOW</b> · Admin <b>@DENIUS09</b></div>' +
+      '<div class="login-foot"><b>V7.0 VIP ENGINE</b> · Admin <b>@DENIUS09</b></div>' +
     '</div></div></div>';
   const btn = document.getElementById('btn_login');
   btn.onclick = doLogin;
@@ -1588,7 +1808,7 @@ function renderTarget() {
       '<div class="field"><label>🎯 MỤC TIÊU (VNĐ)</label><input id="in_target" type="number" inputmode="numeric" value="' + val + '" min="10000" step="10000"></div>' +
       '<button class="btn btn-sakura" id="btn_start"' + (S.loading ? ' disabled' : '') + '>' + (S.loading ? 'ĐANG KHỞI ĐỘNG' : '🚀 BẮT ĐẦU AUTO') + '</button>' +
       (S.error ? '<div class="msg err">⚠️ ' + esc(S.error) + '</div>' : '') +
-      '<div class="setup-hint">⚙️ Reverse → Follow (thua 2) · X2 không giới hạn<br>💰 Vốn mỗi tay: <b>' + fmt(S.setupBaseBet) + 'đ</b></div>' +
+      '<div class="setup-hint">⚙️ VIP Prediction · X2 không giới hạn<br>💰 Vốn mỗi tay: <b>' + fmt(S.setupBaseBet) + 'đ</b></div>' +
     '</div></div></div>';
   const inp = document.getElementById('in_target');
   inp.focus(); inp.select();
@@ -1667,7 +1887,7 @@ function renderMain() {
         '</div>' +
         '<div class="bet-card glass">' +
           '<div><div class="bet-label">SỐ TIỀN CƯỢC</div><div class="bet-value" id="bet_val">' + betTxt + '</div></div>' +
-          '<div class="bet-streak"><small>CHUỖI THUA</small><b id="streak_val">' + (S.config.bet_streak || 0) + '</b></div>' +
+          '<div class="bet-streak"><small>GẤP THẾP</small><b id="streak_val">x' + (1 << Math.min(S.config.bet_streak || 0, 20)) + '</b></div>' +
         '</div>' +
         progressCard +
       '</div>' +
@@ -1813,7 +2033,6 @@ async function tick() {
       S.config.paused = j.config.paused;
       S.config.lose_streak = j.config.lose_streak;
       S.config.bet_streak = j.config.bet_streak;
-      S.config.follow_mode = j.config.follow_mode;
       S.config.base_bet = j.config.base_bet;
       S.config.profit_stop = j.config.profit_stop;
     }
@@ -1864,7 +2083,11 @@ async function tick() {
         ob.classList.add('show');
       }
       const sv = document.getElementById('streak_val');
-      if (sv) sv.textContent = (S.config.bet_streak || 0);
+      if (sv) {
+        const bs = S.config.bet_streak || 0;
+        const mult = Math.min(bs, 20);
+        sv.textContent = 'x' + (1 << mult);
+      }
       const pf = document.querySelector('.progress-fill');
       if (pf && S.config.profit_stop > 0) {
         const pct = Math.min(100, Math.max(0, ((S.stats.profit || 0) / S.config.profit_stop) * 100));
