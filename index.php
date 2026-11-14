@@ -1,10 +1,10 @@
 <?php
 /**
- * DENIUS AUTO v7.0 — VIP PREDICTION ENGINE
- * - denius_predict: engine VIP thực sự (4 markov, 6 pattern, 5 regime, adaptive threshold)
- * - Bỏ hoàn toàn đảo ngược / follow mode
- * - Martingale không giới hạn
- * - Jackpot detection đa field + overlay
+ * DENIUS AUTO v8.0 — ALL-IN REVERSE
+ * - Normal: prediction gốc + martingale vô hạn
+ * - Thua 4 tay → ALL-IN: bẻ prediction + bet toàn bộ balance
+ * - All-in thắng → REVERSE mode: bẻ + gấp thếp từ base, thua 1 tay → về normal
+ * - All-in thua → dừng, reset
  */
 
 $CFG = [
@@ -16,7 +16,7 @@ $CFG = [
         'sessions_api' => 'https://wtx.tele68.com/v1/tx/sessions',
     ],
     'security' => [
-        'hmac_secret' => 'DENIUS_v7_VIP_PREDICTION_HMAC',
+        'hmac_secret' => 'DENIUS_v8_ALLIN_REVERSE_HMAC',
         'session_ttl' => 2592000,
     ],
     'worker' => [
@@ -30,6 +30,8 @@ $CFG = [
         'mode'=>'double', 'max_lose_streak'=>4,
         'auto'=>false, 'paused'=>false, 'lose_streak'=>0,
         'bet_streak'=>0,
+        'allin_pending'=>false,
+        'reverse_mode'=>false,
         'onboarded'=>false,
     ],
     'max_history' => 500,
@@ -212,8 +214,7 @@ function denius_detect_jackpot(array $found, array $dices): bool {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 🧠 DENIUS PREDICT v7.0 — VIP ENGINE
-// 4 Markers / 6 Patterns / 5 Regimes / Adaptive Threshold
+// 🧠 DENIUS PREDICT (giữ nguyên từ v7)
 // ═══════════════════════════════════════════════════════════════
 function _vip_flips(array $R, int $N): int {
     $n = count($R);
@@ -225,7 +226,6 @@ function _vip_flips(array $R, int $N): int {
     }
     return $flips;
 }
-
 function _vip_runs(array $R): array {
     $runs = [];
     $n = count($R);
@@ -233,49 +233,36 @@ function _vip_runs(array $R): array {
     $cur = $R[0]; $len = 1;
     for ($i = 1; $i < $n; $i++) {
         if ($R[$i] === $cur) $len++;
-        else {
-            $runs[] = ['s'=>$cur, 'l'=>$len];
-            $cur = $R[$i];
-            $len = 1;
-        }
+        else { $runs[] = ['s'=>$cur, 'l'=>$len]; $cur = $R[$i]; $len = 1; }
     }
     $runs[] = ['s'=>$cur, 'l'=>$len];
     return $runs;
 }
-
 function _vip_pattern(array $runs): string {
     $rn = count($runs);
     if ($rn < 2) return '';
     $lens = [];
     foreach ($runs as $r) $lens[] = $r['l'];
-
     $c11 = 0;
     for ($i = 0; $i < $rn - 1; $i++) if ($lens[$i] === 1 && $lens[$i+1] === 1) $c11++;
     if ($c11 >= 3) return '1-1';
-
     $c22 = 0;
     for ($i = 0; $i < $rn - 1; $i++) if ($lens[$i] === 2 && $lens[$i+1] === 2) $c22++;
     if ($c22 >= 2) return '2-2';
-
     $c33 = 0;
     for ($i = 0; $i < $rn - 1; $i++) if ($lens[$i] === 3 && $lens[$i+1] === 3) $c33++;
     if ($c33 >= 1) return '3-3';
-
     $c12 = 0;
     for ($i = 0; $i < $rn - 1; $i++) if ($lens[$i] === 1 && $lens[$i+1] === 2) $c12++;
     if ($c12 >= 2) return '1-2';
-
     $c21 = 0;
     for ($i = 0; $i < $rn - 1; $i++) if ($lens[$i] === 2 && $lens[$i+1] === 1) $c21++;
     if ($c21 >= 2) return '2-1';
-
     $maxRun = 0;
     foreach ($lens as $l) if ($l > $maxRun) $maxRun = $l;
     if ($maxRun >= 5) return 'bet';
-
     return '';
 }
-
 function _vip_markov(array $R, int $order): ?string {
     $n = count($R);
     if ($n < $order + 3) return null;
@@ -296,7 +283,6 @@ function _vip_markov(array $R, int $order): ?string {
     if (abs($pt - 0.5) < 0.1) return null;
     return $pt > 0.5 ? 'T' : 'X';
 }
-
 function _vip_entropy(array $R, int $N): float {
     $n = count($R);
     if ($n === 0) return 1.0;
@@ -307,7 +293,6 @@ function _vip_entropy(array $R, int $N): float {
     if ($p <= 0 || $p >= 1) return 0.0;
     return -$p * log($p, 2) - (1-$p) * log(1-$p, 2);
 }
-
 function _vip_momentum(array $R, int $N): float {
     $n = count($R);
     if ($N > $n) $N = $n;
@@ -317,12 +302,6 @@ function _vip_momentum(array $R, int $N): float {
     foreach ($window as $r) if ($r === 'T') $tc++;
     return $tc / $N;
 }
-
-/**
- * ═══ DENIUS PREDICT v7.0 VIP ═══
- * Input: $R (mảng kết quả cũ → mới), $loss_streak
- * Output: 'T' | 'X' — prediction chính thức, KHÔNG đảo
- */
 function denius_predict(array $R, int $loss_streak = 0): string {
     $n = count($R);
     if ($n === 0) return 'T';
@@ -331,11 +310,8 @@ function denius_predict(array $R, int $loss_streak = 0): string {
     $last = $R[$n-1];
     $opp = ($last === 'T') ? 'X' : 'T';
 
-    // ═══ SURVIVAL MODE ═══
-    // Đang thua >= 2 tay → bám tail, bảo toàn vốn
     if ($loss_streak >= 2) return $last;
 
-    // ═══ FEATURE EXTRACTION ═══
     $streak = 1;
     for ($i = $n - 2; $i >= 0; $i--) {
         if ($R[$i] === $last) $streak++;
@@ -366,7 +342,6 @@ function denius_predict(array $R, int $loss_streak = 0): string {
         $avgRunLen = $sum / $rn;
     }
 
-    // ═══ REGIME DETECTION ═══
     $regime = 'normal';
     if ($ent20 > 0.92) $regime = 'chaos';
     elseif ($streak >= 6) $regime = 'long_streak';
@@ -376,28 +351,23 @@ function denius_predict(array $R, int $loss_streak = 0): string {
     elseif ($pattern === '3-3') $regime = 'triple';
     elseif ($bias20 >= 0.68 || $bias20 <= 0.32) $regime = 'biased';
 
-    // ═══ LAYER 1: STREAK SHIELD ═══
     if ($streak >= 3) {
         $rev = 0;
         if ($streak >= 10) $rev += 4;
         elseif ($streak >= 8) $rev += 3;
         elseif ($streak >= 6) $rev += 2;
         elseif ($streak >= 5) $rev += 1;
-
         if ($last === 'T' && $bias20 >= 0.70) $rev += 2;
         if ($last === 'X' && $bias20 <= 0.30) $rev += 2;
         if ($markov2 !== null && $markov2 !== $last) $rev += 2;
         if ($markov3 !== null && $markov3 !== $last) $rev += 1;
         if ($ent20 > 0.90 && $streak >= 5) $rev += 1;
-
         if ($rev >= 6) return $opp;
         return $last;
     }
 
-    // ═══ LAYER 2: ZIGZAG HUNTER ═══
     if ($pattern === '1-1' && $flips8 >= 4) return $opp;
 
-    // ═══ LAYER 3: PREDICTIVE POINT ═══
     if ($n >= 4) {
         if ($R[$n-1] === $R[$n-2] && $R[$n-2] !== $R[$n-3] && $R[$n-3] !== $R[$n-4]) {
             if ($streak === 2) {
@@ -419,22 +389,17 @@ function denius_predict(array $R, int $loss_streak = 0): string {
         }
     }
 
-    // ═══ LAYER 4: CHAOS GUARD ═══
     if ($ent20 > 0.95 && $flips15 >= 8) {
         if ($mom3 > 0.5) return 'T';
         if ($mom3 < 0.5) return 'X';
         return $last;
     }
 
-    // ═══ LAYER 5: SIGNAL VOTING VIP ═══
     $tScore = 0.0;
     $xScore = 0.0;
-
-    // Baseline follow
     if ($last === 'T') $tScore += 1.0;
     else $xScore += 1.0;
 
-    // Markov 2/3/4
     if ($markov2 !== null) {
         if ($markov2 === 'T') $tScore += 2.0;
         else $xScore += 2.0;
@@ -448,7 +413,6 @@ function denius_predict(array $R, int $loss_streak = 0): string {
         else $xScore += 1.0;
     }
 
-    // Pattern
     if ($pattern === '1-1') {
         if ($opp === 'T') $tScore += 2.0;
         else $xScore += 2.0;
@@ -487,9 +451,7 @@ function denius_predict(array $R, int $loss_streak = 0): string {
         }
     }
 
-    // Momentum multi-timeframe
-    $bullish = 0;
-    $bearish = 0;
+    $bullish = 0; $bearish = 0;
     if ($mom3 > 0.6) $bullish++;
     elseif ($mom3 < 0.4) $bearish++;
     if ($mom5 > 0.6) $bullish++;
@@ -499,17 +461,14 @@ function denius_predict(array $R, int $loss_streak = 0): string {
     if ($bullish >= 2 && $bearish === 0) $tScore += 1.5;
     elseif ($bearish >= 2 && $bullish === 0) $xScore += 1.5;
 
-    // Bias reversion extreme
     if ($bias20 > 0.68 && $bias30 > 0.63) $xScore += 2.0;
     elseif ($bias20 < 0.32 && $bias30 < 0.37) $tScore += 2.0;
 
-    // Anti-streak
     if ($flips20 >= 12 && $streak <= 2) {
         if ($opp === 'T') $tScore += 1.0;
         else $xScore += 1.0;
     }
 
-    // Survival analysis
     if ($avgRunLen > 0 && $streak > $avgRunLen + 1) {
         if ($opp === 'T') $tScore += 1.0;
         else $xScore += 1.0;
@@ -524,7 +483,6 @@ function denius_predict(array $R, int $loss_streak = 0): string {
     $majority = ($tScore > $xScore) ? 'T' : 'X';
     $margin = abs($tScore - $xScore) / $total;
 
-    // Adaptive threshold theo regime
     $threshold = 0.24;
     if ($regime === 'chaos') $threshold = 0.35;
     elseif ($regime === 'biased') $threshold = 0.20;
@@ -776,18 +734,58 @@ function worker_step(string $key): array {
                     $c = $d['config'];
                     $st = (int)($c['lose_streak'] ?? 0);
                     $bSt = (int)($c['bet_streak'] ?? 0);
+                    $allinPending = !empty($c['allin_pending']);
+                    $reverseMode = !empty($c['reverse_mode']);
 
-                    if ($win) {
-                        $st = 0;
-                        $bSt = 0;
-                        $d['win_count_total'] = (int)($d['win_count_total'] ?? 0) + 1;
+                    if ($allinPending) {
+                        // Đang xử lý kết quả của phiên ALL-IN
+                        if ($win) {
+                            // All-in thắng → vào REVERSE mode
+                            $c['allin_pending'] = false;
+                            $c['reverse_mode'] = true;
+                            $st = 0;
+                            $bSt = 0;
+                        } else {
+                            // All-in thua → dừng, reset
+                            $c['allin_pending'] = false;
+                            $c['reverse_mode'] = false;
+                            $st = 0;
+                            $bSt = 0;
+                            $c['auto'] = false;
+                            $c['paused'] = true;
+                        }
+                    } elseif ($reverseMode) {
+                        // Đang ở REVERSE mode
+                        if ($win) {
+                            // Reverse thắng → tiếp tục reverse, reset bet_streak
+                            $st = 0;
+                            $bSt = 0;
+                        } else {
+                            // Reverse thua → về NORMAL
+                            $c['reverse_mode'] = false;
+                            $st = 0;
+                            $bSt = 0;
+                        }
                     } else {
-                        $d['loss_count_total'] = (int)($d['loss_count_total'] ?? 0) + 1;
-                        $st++;
-                        $bSt++;
+                        // NORMAL mode
+                        if ($win) {
+                            $st = 0;
+                            $bSt = 0;
+                        } else {
+                            $st++;
+                            $bSt++;
+                            // Thua 4 tay → trigger all-in
+                            if ($st >= 4) {
+                                $c['allin_pending'] = true;
+                            }
+                        }
                     }
+
                     $c['lose_streak'] = $st;
                     $c['bet_streak'] = $bSt;
+
+                    if ($win) $d['win_count_total'] = (int)($d['win_count_total'] ?? 0) + 1;
+                    else $d['loss_count_total'] = (int)($d['loss_count_total'] ?? 0) + 1;
 
                     $betAmt = (int)($d['bet_amount'] ?? 0);
                     $bal = (int)($d['balance'] ?? 0);
@@ -866,28 +864,63 @@ function worker_step(string $key): array {
             }
         }
 
-        $lossStreak = (int)($cfg['lose_streak'] ?? 0);
-        $betStreak  = (int)($cfg['bet_streak'] ?? 0);
+        $lossStreak   = (int)($cfg['lose_streak'] ?? 0);
+        $betStreak    = (int)($cfg['bet_streak'] ?? 0);
+        $allinPending = !empty($cfg['allin_pending']);
+        $reverseMode  = !empty($cfg['reverse_mode']);
 
-        // 🎯 PREDICTION CHÍNH THỨC — KHÔNG đảo
-        $predRaw = denius_predict($R, $lossStreak);
-        $predStr = ($predRaw === 'T') ? 'Tài' : 'Xỉu';
+        // 🎯 RAW prediction từ engine
+        $rawPred = denius_predict($R, $lossStreak);
 
-        // 🎲 BET AMOUNT: martingale không giới hạn (cap bởi balance)
         $baseBet = max(1000, (int)($cfg['base_bet'] ?? 10000));
         $bal = (int)($s['balance'] ?? 0);
-        $betAmt = $baseBet;
-        if ($betStreak > 0) {
+
+        // 🎲 DECIDE mode + pred + bet amount
+        if ($allinPending) {
+            // ALL-IN: bẻ + all-in toàn bộ
+            $finalPred = ($rawPred === 'T') ? 'X' : 'T';
+            $betAmt = $bal;
+            if ($betAmt < 1000) {
+                key_update($key, function($d) {
+                    $d['config']['auto'] = false;
+                    $d['config']['paused'] = true;
+                    $d['config']['allin_pending'] = false;
+                    return $d;
+                });
+                key_log($key, 'error', '🛑 Không đủ vốn để ALL-IN (< 1.000đ) — Dừng auto');
+                return $actions;
+            }
+        } elseif ($reverseMode) {
+            // REVERSE: bẻ + martingale
+            $finalPred = ($rawPred === 'T') ? 'X' : 'T';
             $mult = 1;
-            for ($i = 0; $i < $betStreak; $i++) {
-                $mult *= 2;
-                if ($bal > 0 && $baseBet * $mult >= $bal) break;
-                if ($mult > 1000000000) break;
+            if ($betStreak > 0) {
+                for ($i = 0; $i < $betStreak; $i++) {
+                    $mult *= 2;
+                    if ($bal > 0 && $baseBet * $mult >= $bal) break;
+                    if ($mult > 1000000000) break;
+                }
             }
             $betAmt = $baseBet * $mult;
+            if ($bal > 0 && $betAmt > $bal) $betAmt = $bal;
+            if ($betAmt < 1000) $betAmt = 1000;
+        } else {
+            // NORMAL: raw + martingale
+            $finalPred = $rawPred;
+            $mult = 1;
+            if ($betStreak > 0) {
+                for ($i = 0; $i < $betStreak; $i++) {
+                    $mult *= 2;
+                    if ($bal > 0 && $baseBet * $mult >= $bal) break;
+                    if ($mult > 1000000000) break;
+                }
+            }
+            $betAmt = $baseBet * $mult;
+            if ($bal > 0 && $betAmt > $bal) $betAmt = $bal;
+            if ($betAmt < 1000) $betAmt = 1000;
         }
-        if ($bal > 0 && $betAmt > $bal) $betAmt = $bal;
-        if ($betAmt < 1000) $betAmt = 1000;
+
+        $predStr = ($finalPred === 'T') ? 'Tài' : 'Xỉu';
 
         key_update($key, function($d) use ($predStr, $latestId, $betAmt) {
             $d['pending_pred'] = $predStr;
@@ -895,7 +928,10 @@ function worker_step(string $key): array {
             $d['pending_bet_amount'] = $betAmt;
             return $d;
         });
-        $log = "🎯 #" . ($latestId + 1) . ": $predStr — " . number_format($betAmt) . "đ (bet_streak $betStreak)";
+        $modeStr = 'NORMAL';
+        if ($allinPending) $modeStr = 'ALL-IN';
+        elseif ($reverseMode) $modeStr = 'REVERSE';
+        $log = "🎯 #" . ($latestId + 1) . " [$modeStr]: $predStr — " . number_format($betAmt) . "đ (bet_streak $betStreak)";
         key_log($key, 'info', $log);
         $actions[] = ['type'=>'predict', 'msg'=>$log];
         $s = key_load($key);
@@ -1141,6 +1177,8 @@ try {
             $c['paused'] = false;
             $c['bet_streak'] = 0;
             $c['lose_streak'] = 0;
+            $c['allin_pending'] = false;
+            $c['reverse_mode'] = false;
             $s['config'] = $c;
             key_save($key, $s);
             if (!worker_alive($key)) {
@@ -1161,6 +1199,8 @@ try {
                 $d['config']['paused'] = true;
                 $d['config']['lose_streak'] = 0;
                 $d['config']['bet_streak'] = 0;
+                $d['config']['allin_pending'] = false;
+                $d['config']['reverse_mode'] = false;
                 $d['pending_pred'] = null;
                 $d['pending_session'] = null;
                 $d['pending_bet_amount'] = null;
@@ -1246,7 +1286,7 @@ try {
 exit;
 
 // ═══════════════════════════════════════════════════════════════
-// UI — VIP EFFECTS
+// UI — giữ nguyên v7 + badge mode
 // ═══════════════════════════════════════════════════════════════
 function render_ui(): void { ?>
 <!DOCTYPE html>
@@ -1255,7 +1295,7 @@ function render_ui(): void { ?>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#05020f">
-<title>DENIUS · お兄ちゃん v7</title>
+<title>DENIUS · お兄ちゃん v8</title>
 <style>
 :root{
   --bg-0:#05020f;--bg-1:#0a0618;--bg-2:#120828;--bg-3:#1a0e35;
@@ -1409,7 +1449,7 @@ body{
 @keyframes betPulse{0%{transform:scale(1)}50%{transform:scale(1.15);color:var(--sakura)}100%{transform:scale(1)}}
 .bet-streak{text-align:right}
 .bet-streak small{font-size:9px;color:var(--text-dim);letter-spacing:1px;font-weight:700;text-transform:uppercase;display:block}
-.bet-streak b{font-size:15px;font-weight:900;color:var(--sakura);font-family:"SF Mono",monospace;display:block;margin-top:2px}
+.bet-streak b{font-size:15px;font-weight:900;font-family:"SF Mono",monospace;display:block;margin-top:2px;color:var(--sakura)}
 
 .progress-card{padding:16px 20px;margin-bottom:14px;position:relative;animation:slideIn 0.5s cubic-bezier(0.34,1.56,0.64,1) 0.35s both}
 .progress-label{display:flex;justify-content:space-between;font-size:10px;font-weight:800;letter-spacing:1px;margin-bottom:8px;color:var(--text-dim);align-items:center;gap:8px}
@@ -1500,7 +1540,7 @@ body{
 <div id="toast"></div>
 <script>
 const LOGO_URL = 'https://raw.githubusercontent.com/nguyenha783255-wq/LOGO-LC79/main/IMG_20260901_094944_094.jpg';
-const LS_KEY = 'denius_v7';
+const LS_KEY = 'denius_v8';
 const app = document.getElementById('app');
 const toastBox = document.getElementById('toast');
 
@@ -1508,7 +1548,7 @@ const S = {
   step: 'login', tab: 'main',
   user: '', nickname: '', balance: 0, authToken: '', device: '',
   loading: false, error: '',
-  config: {base_bet:0,profit_stop:0,auto:false,paused:false,lose_streak:0,bet_streak:0},
+  config: {base_bet:0,profit_stop:0,auto:false,paused:false,lose_streak:0,bet_streak:0,allin_pending:false,reverse_mode:false},
   history: [], stats: {wins:0,losses:0,total:0,winrate:0,profit:0},
   pendingPred: null, pendingSession: null, pendingBetAmount: null,
   workerAlive: false,
@@ -1672,6 +1712,18 @@ function loadAuth() {
 }
 function clearAuth() { try { localStorage.removeItem(LS_KEY); } catch(e) {} }
 
+function getModeInfo() {
+  const bs = S.config.bet_streak || 0;
+  const mult = Math.min(bs, 20);
+  if (S.config.allin_pending) {
+    return { text: '🔥 ALL-IN', color: 'var(--gold)' };
+  }
+  if (S.config.reverse_mode) {
+    return { text: '🔄 REVERSE x' + (1 << mult), color: 'var(--cyan)' };
+  }
+  return { text: 'x' + (1 << mult), color: 'var(--sakura)' };
+}
+
 function render() {
   if (S.step === 'login') renderLogin();
   else if (S.step === 'info') renderInfo();
@@ -1688,12 +1740,12 @@ function renderLogin() {
     '<div class="screen"><div class="login-wrap"><div class="login-card glass neon" style="position:relative">' +
       '<div class="logo-wrap"><img src="' + LOGO_URL + '" class="logo-img" onerror="this.style.display=\'none\'"></div>' +
       '<div class="brand-title">DENIUS</div>' +
-      '<div class="brand-sub"><span class="jp">お兄ちゃん</span> · VIP PREDICTION v7</div>' +
+      '<div class="brand-sub"><span class="jp">お兄ちゃん</span> · ALL-IN REVERSE v8</div>' +
       '<div class="field"><label>👤 TÀI KHOẢN</label><input id="in_u" type="text" placeholder="Nhập tài khoản..." value="' + esc(S.user) + '"></div>' +
       '<div class="field"><label>🔒 MẬT KHẨU</label><input id="in_p" type="password" placeholder="••••••••"></div>' +
       '<button class="btn btn-sakura" id="btn_login"' + (S.loading ? ' disabled' : '') + '>' + (S.loading ? 'ĐANG XÁC THỰC' : 'ĐĂNG NHẬP') + '</button>' +
       (S.error ? '<div class="msg err">⚠️ ' + esc(S.error) + '</div>' : '') +
-      '<div class="login-foot"><b>V7.0 VIP ENGINE</b> · Admin <b>@DENIUS09</b></div>' +
+      '<div class="login-foot"><b>V8.0 ALL-IN REVERSE</b> · Admin <b>@DENIUS09</b></div>' +
     '</div></div></div>';
   const btn = document.getElementById('btn_login');
   btn.onclick = doLogin;
@@ -1779,7 +1831,7 @@ function renderBaseBet() {
       '<div class="field"><label>💰 SỐ VỐN (VNĐ)</label><input id="in_base" type="number" inputmode="numeric" value="' + val + '" min="1000" step="1000"></div>' +
       '<button class="btn btn-sakura" id="btn_next1">TIẾP TỤC →</button>' +
       (S.error ? '<div class="msg err">⚠️ ' + esc(S.error) + '</div>' : '') +
-      '<div class="setup-hint">💎 Gấp thếp X2 · KHÔNG giới hạn · cap bởi số dư</div>' +
+      '<div class="setup-hint">💎 Gấp thếp X2 không giới hạn · Thua 4 → ALL-IN</div>' +
     '</div></div></div>';
   const inp = document.getElementById('in_base');
   inp.focus(); inp.select();
@@ -1808,7 +1860,7 @@ function renderTarget() {
       '<div class="field"><label>🎯 MỤC TIÊU (VNĐ)</label><input id="in_target" type="number" inputmode="numeric" value="' + val + '" min="10000" step="10000"></div>' +
       '<button class="btn btn-sakura" id="btn_start"' + (S.loading ? ' disabled' : '') + '>' + (S.loading ? 'ĐANG KHỞI ĐỘNG' : '🚀 BẮT ĐẦU AUTO') + '</button>' +
       (S.error ? '<div class="msg err">⚠️ ' + esc(S.error) + '</div>' : '') +
-      '<div class="setup-hint">⚙️ VIP Prediction · X2 không giới hạn<br>💰 Vốn mỗi tay: <b>' + fmt(S.setupBaseBet) + 'đ</b></div>' +
+      '<div class="setup-hint">⚙️ All-in sau 4 thua · Reverse mode sau thắng<br>💰 Vốn mỗi tay: <b>' + fmt(S.setupBaseBet) + 'đ</b></div>' +
     '</div></div></div>';
   const inp = document.getElementById('in_target');
   inp.focus(); inp.select();
@@ -1851,6 +1903,7 @@ function renderMain() {
   let betTxt = '—';
   if (S.pendingBetAmount) betTxt = fmt(S.pendingBetAmount) + 'đ';
 
+  const modeInfo = getModeInfo();
   const profit = S.stats.profit || 0;
   const target = S.config.profit_stop || 0;
   let progressPct = 0;
@@ -1887,7 +1940,7 @@ function renderMain() {
         '</div>' +
         '<div class="bet-card glass">' +
           '<div><div class="bet-label">SỐ TIỀN CƯỢC</div><div class="bet-value" id="bet_val">' + betTxt + '</div></div>' +
-          '<div class="bet-streak"><small>GẤP THẾP</small><b id="streak_val">x' + (1 << Math.min(S.config.bet_streak || 0, 20)) + '</b></div>' +
+          '<div class="bet-streak"><small>CHẾ ĐỘ</small><b id="mode_val" style="color:' + modeInfo.color + '">' + modeInfo.text + '</b></div>' +
         '</div>' +
         progressCard +
       '</div>' +
@@ -2033,6 +2086,8 @@ async function tick() {
       S.config.paused = j.config.paused;
       S.config.lose_streak = j.config.lose_streak;
       S.config.bet_streak = j.config.bet_streak;
+      S.config.allin_pending = !!j.config.allin_pending;
+      S.config.reverse_mode = !!j.config.reverse_mode;
       S.config.base_bet = j.config.base_bet;
       S.config.profit_stop = j.config.profit_stop;
     }
@@ -2077,16 +2132,16 @@ async function tick() {
           setTimeout(() => bv2.classList.remove('pulse'), 600);
         }
       }
+      const mv = document.getElementById('mode_val');
+      if (mv) {
+        const mi = getModeInfo();
+        mv.textContent = mi.text;
+        mv.style.color = mi.color;
+      }
       const ob = document.getElementById('outcome_box');
       if (ob && S.history[0]) {
         ob.innerHTML = renderOutcome(S.history[0]);
         ob.classList.add('show');
-      }
-      const sv = document.getElementById('streak_val');
-      if (sv) {
-        const bs = S.config.bet_streak || 0;
-        const mult = Math.min(bs, 20);
-        sv.textContent = 'x' + (1 << mult);
       }
       const pf = document.querySelector('.progress-fill');
       if (pf && S.config.profit_stop > 0) {
