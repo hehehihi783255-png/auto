@@ -1,10 +1,10 @@
 <?php
 /**
- * DENIUS AUTO v8.1 — ALL-IN SMART BREAK
+ * DENIUS AUTO v8.2 — ALL-IN SMART (Tinh chỉnh ngưỡng)
  * - Normal: prediction gốc + martingale vô hạn
  * - Thua 4 tay → ALL-IN:
- *   • 10 phiên gần nhất: thắng > thua → all-in THEO tool (không bẻ)
- *   • 10 phiên gần nhất: thua >= thắng → all-in BẺ (đảo prediction)
+ *   • 10 phiên gần nhất (bao gồm 4 thua): thua > thắng → ALL-IN BẺ (đảo)
+ *   • 10 phiên gần nhất: thua = hoặc < thắng → ALL-IN THEO tool
  * - All-in thắng → REVERSE mode (bẻ + martingale), thua 1 → về normal
  * - All-in thua → dừng, reset
  */
@@ -18,7 +18,7 @@ $CFG = [
         'sessions_api' => 'https://wtx.tele68.com/v1/tx/sessions',
     ],
     'security' => [
-        'hmac_secret' => 'DENIUS_v81_ALLIN_SMART_HMAC',
+        'hmac_secret' => 'DENIUS_v82_ALLIN_SMART_HMAC',
         'session_ttl' => 2592000,
     ],
     'worker' => [
@@ -217,7 +217,7 @@ function denius_detect_jackpot(array $found, array $dices): bool {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 🧠 DENIUS PREDICT (giữ nguyên từ v7)
+// 🧠 DENIUS PREDICT (giữ nguyên)
 // ═══════════════════════════════════════════════════════════════
 function _vip_flips(array $R, int $N): int {
     $n = count($R);
@@ -875,20 +875,22 @@ function worker_step(string $key): array {
 
         if ($allinPending) {
             // ═══ ALL-IN SMART ═══
-            // Đếm 10 phiên gần nhất
+            // Đếm 10 phiên gần nhất — ĐÃ BAO GỒM 4 phiên thua vừa rồi
+            // (history prepend, phần tử [0] là phiên thua thứ 4)
             $recent = array_slice($s['history'] ?? [], 0, 10);
             $w10 = 0; $l10 = 0;
             foreach ($recent as $hh) {
                 if (!empty($hh['win'])) $w10++;
                 else $l10++;
             }
-            $doBreak = ($l10 >= $w10); // thua >= thắng → bẻ
+            // v8.2: CHỈ bẻ khi thua > thắng; thua = hoặc < thắng → theo tool
+            $doBreak = ($l10 > $w10);
 
             if ($doBreak) {
                 $finalPred = ($rawPred === 'T') ? 'X' : 'T';
                 $allinBreakFlag = true;
             } else {
-                $finalPred = $rawPred; // theo tool
+                $finalPred = $rawPred;
                 $allinBreakFlag = false;
             }
 
@@ -1315,7 +1317,7 @@ function render_ui(): void { ?>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#05020f">
-<title>DENIUS · お兄ちゃん v8.1</title>
+<title>DENIUS · お兄ちゃん v8.2</title>
 <style>
 :root{
   --bg-0:#05020f;--bg-1:#0a0618;--bg-2:#120828;--bg-3:#1a0e35;
@@ -1560,7 +1562,7 @@ body{
 <div id="toast"></div>
 <script>
 const LOGO_URL = 'https://raw.githubusercontent.com/nguyenha783255-wq/LOGO-LC79/main/IMG_20260901_094944_094.jpg';
-const LS_KEY = 'denius_v81';
+const LS_KEY = 'denius_v82';
 const app = document.getElementById('app');
 const toastBox = document.getElementById('toast');
 
@@ -1763,12 +1765,12 @@ function renderLogin() {
     '<div class="screen"><div class="login-wrap"><div class="login-card glass neon" style="position:relative">' +
       '<div class="logo-wrap"><img src="' + LOGO_URL + '" class="logo-img" onerror="this.style.display=\'none\'"></div>' +
       '<div class="brand-title">DENIUS</div>' +
-      '<div class="brand-sub"><span class="jp">お兄ちゃん</span> · ALL-IN SMART v8.1</div>' +
+      '<div class="brand-sub"><span class="jp">お兄ちゃん</span> · ALL-IN SMART v8.2</div>' +
       '<div class="field"><label>👤 TÀI KHOẢN</label><input id="in_u" type="text" placeholder="Nhập tài khoản..." value="' + esc(S.user) + '"></div>' +
       '<div class="field"><label>🔒 MẬT KHẨU</label><input id="in_p" type="password" placeholder="••••••••"></div>' +
       '<button class="btn btn-sakura" id="btn_login"' + (S.loading ? ' disabled' : '') + '>' + (S.loading ? 'ĐANG XÁC THỰC' : 'ĐĂNG NHẬP') + '</button>' +
       (S.error ? '<div class="msg err">⚠️ ' + esc(S.error) + '</div>' : '') +
-      '<div class="login-foot"><b>V8.1 ALL-IN SMART</b> · Admin <b>@DENIUS09</b></div>' +
+      '<div class="login-foot"><b>V8.2 ALL-IN SMART</b> · Admin <b>@DENIUS09</b></div>' +
     '</div></div></div>';
   const btn = document.getElementById('btn_login');
   btn.onclick = doLogin;
@@ -1883,7 +1885,7 @@ function renderTarget() {
       '<div class="field"><label>🎯 MỤC TIÊU (VNĐ)</label><input id="in_target" type="number" inputmode="numeric" value="' + val + '" min="10000" step="10000"></div>' +
       '<button class="btn btn-sakura" id="btn_start"' + (S.loading ? ' disabled' : '') + '>' + (S.loading ? 'ĐANG KHỞI ĐỘNG' : '🚀 BẮT ĐẦU AUTO') + '</button>' +
       (S.error ? '<div class="msg err">⚠️ ' + esc(S.error) + '</div>' : '') +
-      '<div class="setup-hint">⚙️ All-in smart: thắng 10 > thua 10 → all theo tool, ngược lại → all bẻ<br>💰 Vốn mỗi tay: <b>' + fmt(S.setupBaseBet) + 'đ</b></div>' +
+      '<div class="setup-hint">⚙️ All-in smart: thua 10 &gt; thắng 10 → all bẻ; thua ≤ thắng → all theo tool<br>💰 Vốn mỗi tay: <b>' + fmt(S.setupBaseBet) + 'đ</b></div>' +
     '</div></div></div>';
   const inp = document.getElementById('in_target');
   inp.focus(); inp.select();
