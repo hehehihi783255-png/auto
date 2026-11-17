@@ -1,11 +1,11 @@
 <?php
 /**
- * DENIUS AUTO v9.0 — CÔNG THỨC CHUẨN
- * A = dice1(phiên trước) + lastDigit(latestId)
- * B = tổng 3 xúc xắc phiên (latestId - 22)
- * K = |A - B| ; final = K-2 nếu B>A ; K nếu A>B ; 0 nếu A=B
- * final=4 → BỎ TAY ; final=5 → theo phiên trước ; final<10 (khác 4,5) → bẻ ; final>=10 → chẵn XỈU/lẻ TÀI ; final âm → chẵn XỈU/lẻ TÀI
- * Nếu đang bệt + dự đoán ban đầu là bẻ → override bằng K parity (K chẵn TÀI / K lẻ XỈU)
+ * DENIUS AUTO v9.1 — CÔNG THỨC CHUẨN + FIX AUTO BET
+ * A = dice1(prev) + lastDigit(latestId)
+ * B = tổng 3 xúc xắc phiên (latestId - 22)   [configurable via b_offset]
+ * K = |A-B|; final = (B>A ? K-2 : (A>B ? K : 0))
+ * final=4 → BỎ TAY; final=5 → theo prev; final<10 (khác 4,5) → bẻ; final>=10 → chẵn XỈU/lẻ TÀI; final âm → abs parity
+ * Bệt + pred ban đầu bẻ → override K parity (K chẵn TÀI / K lẻ XỈU)
  * Gấp thếp: base × 2^bet_streak, reset khi thắng
  */
 
@@ -16,9 +16,13 @@ $CFG = [
         'ws_host'      => 'wtx.tele68.com',
         'ws_path'      => '/tx/',
         'sessions_api' => 'https://wtx.tele68.com/v1/tx/sessions',
+        'b_offset'     => 22,  // B = tổng dice phiên (latestId - b_offset)
+                                // 22 = phiên thứ 22 từ phiên trước (khớp ví dụ #763560 = #763582 - 22)
+                                // 21 = "phiên cách phiên hiện tại 21 phiên trước" (nếu phiên hiện tại = latestId)
+                                // 20 = "phiên cách phiên cần dự đoán 21 phiên trước"
     ],
     'security' => [
-        'hmac_secret' => 'DENIUS_v9_FORMULA_HMAC',
+        'hmac_secret' => 'DENIUS_v91_FORMULA_HMAC',
         'session_ttl' => 2592000,
     ],
     'worker' => [
@@ -28,13 +32,9 @@ $CFG = [
         'respawn_buffer' => 60,
     ],
     'default_config' => [
-        'base_bet'    => 0,
-        'profit_stop' => 0,
-        'auto'        => false,
-        'paused'      => false,
-        'lose_streak' => 0,
-        'bet_streak'  => 0,
-        'onboarded'   => false,
+        'base_bet'=>0, 'profit_stop'=>0,
+        'auto'=>false, 'paused'=>false, 'lose_streak'=>0, 'bet_streak'=>0,
+        'onboarded'=>false,
     ],
     'max_history' => 500,
 ];
@@ -216,12 +216,9 @@ function denius_detect_jackpot(array $found, array $dices): bool {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 🧮 CÔNG THỨC DENIUS v9
+// 🧮 CÔNG THỨC DENIUS v9.1
 // ═══════════════════════════════════════════════════════════════
 
-/**
- * Map kết quả từ API về 'TAI' | 'XIU' | null
- */
 function denius_map_result(string $raw): ?string {
     $map = [
         'Tài'=>'TAI','Xỉu'=>'XIU','tai'=>'TAI','xiu'=>'XIU',
@@ -231,10 +228,6 @@ function denius_map_result(string $raw): ?string {
     return null;
 }
 
-/**
- * Đếm chuỗi bệt từ sessions (mới nhất trước)
- * Trả về ['side'=>'TAI'|'XIU'|null, 'len'=>int]
- */
 function denius_count_streak(array $sessions): array {
     $n = count($sessions);
     if ($n === 0) return ['side'=>null, 'len'=>0];
@@ -249,9 +242,6 @@ function denius_count_streak(array $sessions): array {
     return ['side'=>$first, 'len'=>$len];
 }
 
-/**
- * Tìm phiên có id = $targetId trong sessions
- */
 function denius_find_session(array $sessions, int $targetId): ?array {
     foreach ($sessions as $row) {
         if ((int)$row['id'] === $targetId) return $row;
@@ -259,14 +249,13 @@ function denius_find_session(array $sessions, int $targetId): ?array {
     return null;
 }
 
-/**
- * Tìm phiên thứ 22 (latestId - 22). Fallback: phiên xa nhất có trong list (nhưng < latestId)
- */
-function denius_find_session_22(array $sessions, int $latestId): ?array {
-    $targetId = $latestId - 22;
+function denius_find_session_b(array $sessions, int $latestId, int $offset): array {
+    $targetId = $latestId - $offset;
     $exact = denius_find_session($sessions, $targetId);
-    if ($exact !== null) return $exact;
-    // Fallback: phiên xa nhất < latestId
+    if ($exact !== null) {
+        return ['row'=>$exact, 'exact'=>true, 'wanted'=>$targetId, 'actual'=>$targetId];
+    }
+    // Fallback: phiên xa nhất có trong list
     $furthest = null;
     $minId = PHP_INT_MAX;
     foreach ($sessions as $row) {
@@ -276,21 +265,27 @@ function denius_find_session_22(array $sessions, int $latestId): ?array {
             $furthest = $row;
         }
     }
-    return $furthest;
+    if ($furthest !== null) {
+        return ['row'=>$furthest, 'exact'=>false, 'wanted'=>$targetId, 'actual'=>$minId];
+    }
+    return ['row'=>null, 'exact'=>false, 'wanted'=>$targetId, 'actual'=>null];
 }
 
 /**
  * Tính công thức DENIUS cho phiên latestId + 1
- * Trả về array đầy đủ: skip, prediction, A, B, K, final, streak, streakSide, prevResult, reason
  */
 function denius_compute(array $sessions, int $latestId): array {
+    global $CFG;
+    $bOffset = (int)($CFG['game']['b_offset'] ?? 22);
+
     $default = [
-        'skip'=>true, 'prediction'=>null, 'A'=>0, 'B'=>0, 'K'=>0, 'final'=>0,
+        'skip'=>true, 'prediction'=>null,
+        'A'=>0, 'B'=>0, 'K'=>0, 'final'=>0,
         'streak'=>0, 'streakSide'=>null, 'prevResult'=>null,
+        'bExact'=>false, 'bWanted'=>0, 'bActual'=>0,
         'reason'=>'Không đủ dữ liệu',
     ];
 
-    // Phiên trước (latestId)
     $prev = denius_find_session($sessions, $latestId);
     if ($prev === null) {
         $default['reason'] = 'Không tìm thấy phiên trước #' . $latestId;
@@ -299,29 +294,29 @@ function denius_compute(array $sessions, int $latestId): array {
 
     $prevSide = denius_map_result((string)($prev['resultTruyenThong'] ?? ''));
     if ($prevSide === null) {
-        $default['reason'] = 'Phiên trước #' . $latestId . ' chưa có kết quả';
+        $default['reason'] = 'Phiên trước #' . $latestId . ' chưa có KQ';
         return $default;
     }
 
-    // A = dice1(phiên trước) + lastDigit(latestId)
+    // A = dice1(prev) + lastDigit(latestId)
     $prevDices = $prev['dices'] ?? [0,0,0];
     $dice1 = (int)($prevDices[0] ?? 0);
     $lastDigit = $latestId % 10;
     $A = $dice1 + $lastDigit;
 
-    // B = tổng 3 xúc xắc của phiên thứ 22 (latestId - 22)
-    $s22 = denius_find_session_22($sessions, $latestId);
-    if ($s22 === null) {
+    // B = tổng 3 xúc xắc phiên (latestId - offset)
+    $bResult = denius_find_session_b($sessions, $latestId, $bOffset);
+    if ($bResult['row'] === null) {
         $default['A'] = $A;
         $default['prevResult'] = $prevSide;
-        $default['reason'] = 'Không tìm thấy phiên thứ 22 (cần phiên #' . ($latestId - 22) . ')';
+        $default['bWanted'] = $bResult['wanted'];
+        $default['reason'] = 'Không tìm thấy phiên B (#'.$bResult['wanted'].') và không có phiên xa hơn';
         return $default;
     }
-    $dices22 = $s22['dices'] ?? [0,0,0];
-    // ⚠️ B = tổng 3 xúc xắc phiên 22 (điểm tự nhiên)
-    // Nếu bạn muốn B = dice1(phiên 22) + lastDigit(id phiên 22), thay dòng dưới bằng:
-    //   $B = ((int)($dices22[0] ?? 0)) + (((int)$s22['id']) % 10);
-    $B = array_sum($dices22);
+    $bRow = $bResult['row'];
+    $bDices = $bRow['dices'] ?? [0,0,0];
+    $B = 0;
+    foreach ($bDices as $v) $B += (int)$v;
 
     // K và final
     $K = 0;
@@ -355,28 +350,28 @@ function denius_compute(array $sessions, int $latestId): array {
         $abs = abs($final);
         if ($abs % 2 === 0) $prediction = 'XIU';
         else $prediction = 'TAI';
-        $reason = 'Kết quả âm (final=' . $final . ') → ' . $prediction;
+        $reason = 'final âm ('.$final.') → ' . $prediction;
     } elseif ($final >= 10) {
         if ($final % 2 === 0) $prediction = 'XIU';
         else $prediction = 'TAI';
-        $reason = 'Kết quả >=10 (final=' . $final . ') → ' . $prediction;
+        $reason = 'final≥10 ('.$final.') → ' . $prediction;
     } else {
         // 0..9, khác 4,5 → bẻ phiên trước
         if ($prevSide === 'TAI') $prediction = 'XIU';
         else $prediction = 'TAI';
-        $reason = 'Bẻ phiên trước (final=' . $final . ') → ' . $prediction;
+        $reason = 'Bẻ phiên trước (final='.$final.') → ' . $prediction;
     }
 
     // Kiểm tra bẻ bệt
-    if (!$skip && $streakInfo['len'] >= 2 && $streakInfo['side'] !== null) {
+    if (!$skip && $streakInfo['len'] >= 2 && $streakInfo['side'] !== null && $prediction !== null) {
         $betSide = $streakInfo['side'];
         if ($prediction !== $betSide) {
             // Dự đoán ban đầu là BẺ BỆT → override bằng K parity
             if ($K % 2 === 0) $prediction = 'TAI';
             else $prediction = 'XIU';
-            $reason .= ' | BẺ BỆT override: K=' . $K . ' → ' . $prediction;
+            $reason .= ' | BẺ BỆT override: K=' . $K . ' (chẵn TÀI/lẻ XỈU) → ' . $prediction;
         } else {
-            $reason .= ' | Đang bệt ' . $betSide . ', giữ nguyên theo bệt';
+            $reason .= ' | Đang bệt ' . $betSide . ' (len='.$streakInfo['len'].'), giữ nguyên theo bệt';
         }
     }
 
@@ -390,6 +385,9 @@ function denius_compute(array $sessions, int $latestId): array {
         'streak'=>$streakInfo['len'],
         'streakSide'=>$streakInfo['side'],
         'prevResult'=>$prevSide,
+        'bExact'=>$bResult['exact'],
+        'bWanted'=>$bResult['wanted'],
+        'bActual'=>(int)($bResult['actual'] ?? 0),
         'reason'=>$reason,
     ];
 }
@@ -586,6 +584,7 @@ function worker_step(string $key): array {
     $cfg = $s['config'] ?? [];
     if (empty($cfg['auto']) || !empty($cfg['paused'])) return $actions;
 
+    // Check profit target
     $pTarget = (int)($cfg['profit_stop'] ?? 0);
     $pTotal = (int)($s['profit_total'] ?? 0);
     if ($pTarget > 0 && $pTotal >= $pTarget && empty($s['pending_pred'])) {
@@ -599,10 +598,30 @@ function worker_step(string $key): array {
     }
 
     $data = fetch_sessions_api();
-    if (!$data || empty($data['list'])) return $actions;
+    if (!$data || empty($data['list'])) {
+        // Chỉ log khi chuyển trạng thái để tránh spam
+        if (($s['last_sessions_fail_log'] ?? 0) < time() - 30) {
+            key_log($key, 'warn', '⚠️ sessions API fail hoặc list rỗng');
+            key_update($key, fn($d) => array_merge($d, ['last_sessions_fail_log' => time()]));
+        }
+        return $actions;
+    }
     $sessions = $data['list'];
-    $latest = $sessions[0];
-    $latestId = (int)$latest['id'];
+
+    // Tìm phiên mới nhất có KQ
+    $latestId = 0;
+    foreach ($sessions as $row) {
+        $res = denius_map_result((string)($row['resultTruyenThong'] ?? ''));
+        if ($res !== null) {
+            $latestId = (int)$row['id'];
+            break;
+        }
+    }
+    if ($latestId === 0) {
+        key_log($key, 'warn', '⚠️ Không tìm phiên nào có KQ trong sessions');
+        return $actions;
+    }
+
     $lastId = (int)($s['last_session_id'] ?? 0);
 
     if ($lastId === 0) {
@@ -618,7 +637,8 @@ function worker_step(string $key): array {
             $result = denius_map_result((string)($found['resultTruyenThong'] ?? ''));
             if ($result === null) continue;
             $dices = $found['dices'] ?? [0,0,0];
-            $tong = array_sum($dices);
+            $tong = 0;
+            foreach ($dices as $v) $tong += (int)$v;
             $jackpot = denius_detect_jackpot($found, $dices);
 
             if (($s['pending_session'] ?? null) == $sid && !empty($s['pending_pred'])) {
@@ -693,6 +713,7 @@ function worker_step(string $key): array {
         key_update($key, fn($d) => array_merge($d, ['last_session_id'=>$latestId]));
     }
 
+    // Clear pending stale
     if (!empty($s['pending_session']) && (int)$s['pending_session'] <= $latestId) {
         key_update($key, function($d) {
             $d['pending_pred']=null;
@@ -705,20 +726,34 @@ function worker_step(string $key): array {
         $s = key_load($key);
     }
 
+    // Compute prediction
     $cfg = $s['config'];
     if (!empty($cfg['auto']) && empty($cfg['paused']) && empty($s['pending_pred'])) {
-        // 🧮 Tính công thức DENIUS cho phiên latestId+1
         $result = denius_compute($sessions, $latestId);
 
+        // Anti-spam log: chỉ log khi latestId thay đổi
+        $lastComputeId = (int)($s['last_compute_id'] ?? 0);
+        $shouldLog = ($lastComputeId !== $latestId);
+
         if ($result['skip']) {
-            $msg = '⏭ BỎ TAY phiên #' . ($latestId + 1) . ' — ' . $result['reason'];
-            key_log($key, 'info', $msg);
-            $actions[] = ['type'=>'skip', 'msg'=>$msg];
+            if ($shouldLog) {
+                $msg = '⏭ BỎ TAY phiên #' . ($latestId + 1)
+                     . ' | A=' . $result['A'] . ' B=' . $result['B']
+                     . ' K=' . $result['K'] . ' final=' . $result['final']
+                     . ' | ' . $result['reason'];
+                key_log($key, 'info', $msg);
+                key_update($key, fn($d) => array_merge($d, ['last_compute_id' => $latestId]));
+            }
             return $actions;
         }
 
         if ($result['prediction'] === null) {
-            key_log($key, 'warn', '⚠️ Không có prediction — ' . $result['reason']);
+            if ($shouldLog) {
+                $msg = '⚠️ Không có prediction phiên #' . ($latestId + 1)
+                     . ' | ' . $result['reason'];
+                key_log($key, 'warn', $msg);
+                key_update($key, fn($d) => array_merge($d, ['last_compute_id' => $latestId]));
+            }
             return $actions;
         }
 
@@ -742,20 +777,32 @@ function worker_step(string $key): array {
             return $actions;
         }
 
+        // Lưu pending
         key_update($key, function($d) use ($predStr, $latestId, $betAmt) {
             $d['pending_pred'] = $predStr;
             $d['pending_session'] = $latestId + 1;
             $d['pending_bet_amount'] = $betAmt;
+            $d['last_compute_id'] = $latestId;
             return $d;
         });
-        $log = "🎯 #" . ($latestId + 1) . ": $predStr — " . number_format($betAmt) . "đ (streak " . $betStreak . ")"
-             . " | A=" . $result['A'] . " B=" . $result['B'] . " K=" . $result['K'] . " final=" . $result['final']
-             . " | " . $result['reason'];
-        key_log($key, 'info', $log);
-        $actions[] = ['type'=>'predict', 'msg'=>$log];
+
+        if ($shouldLog) {
+            $log = "🎯 #" . ($latestId + 1) . ": $predStr — " . number_format($betAmt)
+                 . "đ (streak " . $betStreak . ")"
+                 . " | A=" . $result['A'] . " B=" . $result['B']
+                 . " K=" . $result['K'] . " final=" . $result['final']
+                 . " | " . $result['reason'];
+            if (!$result['bExact']) {
+                $log .= " | ⚠️ B fallback: dùng #" . $result['bActual']
+                     . " thay vì #" . $result['bWanted'];
+            }
+            key_log($key, 'info', $log);
+            $actions[] = ['type'=>'predict', 'msg'=>$log];
+        }
         $s = key_load($key);
     }
 
+    // WS bet
     $cfg = $s['config'];
     if (!empty($s['pending_pred']) && !empty($cfg['auto']) && empty($cfg['paused'])) {
         if (($s['bet_session'] ?? null) != $s['pending_session']) {
@@ -994,8 +1041,14 @@ try {
             $c['paused'] = false;
             $c['bet_streak'] = 0;
             $c['lose_streak'] = 0;
-            unset($c['allin_pending'], $c['allin_break'], $c['reverse_mode'], $c['follow_mode'], $c['follow_had_win'], $c['follow_losses'], $c['mode'], $c['max_lose_streak']);
+            // Clear pending cũ để tránh stuck
             $s['config'] = $c;
+            $s['pending_pred'] = null;
+            $s['pending_session'] = null;
+            $s['pending_bet_amount'] = null;
+            $s['bet_session'] = null;
+            $s['bet_amount'] = 0;
+            $s['last_compute_id'] = 0;
             key_save($key, $s);
             if (!worker_alive($key)) {
                 @unlink(KEY_DIR . '/' . hash('sha256', strtolower($key)) . '.lock');
@@ -1015,7 +1068,6 @@ try {
                 $d['config']['paused'] = true;
                 $d['config']['lose_streak'] = 0;
                 $d['config']['bet_streak'] = 0;
-                unset($d['config']['allin_pending'], $d['config']['allin_break'], $d['config']['reverse_mode']);
                 $d['pending_pred'] = null;
                 $d['pending_session'] = null;
                 $d['pending_bet_amount'] = null;
@@ -1058,6 +1110,7 @@ try {
                 'win_count_total'=>$wins,'loss_count_total'=>$losses,'profit_total'=>$profit,
                 'stats'=>['wins'=>$wins,'losses'=>$losses,'total'=>$tot,'winrate'=>$wr,'profit'=>$profit],
                 'worker_alive'=>worker_alive($key),
+                'logs'=>array_slice($s['logs']??[], 0, 20),
                 'ts'=>time(),
             ]);
             exit;
@@ -1093,6 +1146,31 @@ try {
             }
             echo json_encode(['ok'=>true]);
             exit;
+
+        case 'debug_compute':
+            // Endpoint debug để user verify công thức
+            $u = trim($_GET['user'] ?? '');
+            $tk = trim($_GET['auth_token'] ?? '');
+            if (!verify_token($tk, $u)) { echo json_encode(['ok'=>false,'msg'=>'Unauthorized']); exit; }
+            $data = fetch_sessions_api();
+            if (!$data || empty($data['list'])) { echo json_encode(['ok'=>false,'msg'=>'sessions API fail']); exit; }
+            $sessions = $data['list'];
+            $latestId = 0;
+            foreach ($sessions as $row) {
+                $res = denius_map_result((string)($row['resultTruyenThong'] ?? ''));
+                if ($res !== null) { $latestId = (int)$row['id']; break; }
+            }
+            if ($latestId === 0) { echo json_encode(['ok'=>false,'msg'=>'Không tìm phiên có KQ']); exit; }
+            $result = denius_compute($sessions, $latestId);
+            echo json_encode([
+                'ok'=>true,
+                'latestId'=>$latestId,
+                'predictFor'=>$latestId+1,
+                'sessionsCount'=>count($sessions),
+                'result'=>$result,
+                'b_offset'=>$CFG['game']['b_offset'],
+            ]);
+            exit;
     }
     echo json_encode(['ok'=>false,'msg'=>'Action lạ']);
 } catch (Throwable $e) {
@@ -1101,7 +1179,7 @@ try {
 exit;
 
 // ═══════════════════════════════════════════════════════════════
-// UI
+// UI — giữ nguyên style từ v8.2
 // ═══════════════════════════════════════════════════════════════
 function render_ui(): void { ?>
 <!DOCTYPE html>
@@ -1110,29 +1188,15 @@ function render_ui(): void { ?>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#05020f">
-<title>DENIUS · Công thức v9</title>
+<title>DENIUS · Công thức v9.1</title>
 <style>
-:root{
-  --bg-0:#05020f;--bg-1:#0a0618;--bg-2:#120828;--bg-3:#1a0e35;
-  --sakura:#ffb7d5;--sakura-bright:#ffd6e8;
-  --lavender:#c4a7e7;--violet:#8b6fc4;
-  --gold:#ffd966;--gold-bright:#ffe89a;
-  --mint:#7ef0b4;--ruby:#ff5c7a;--cyan:#6ee7ff;
-  --text:#fff5eb;--text-dim:#a89cbd;--muted:#5e4d75;
-  --border:rgba(255,183,213,0.10);--border-strong:rgba(255,183,213,0.26);
-}
+:root{--bg-0:#05020f;--bg-1:#0a0618;--bg-2:#120828;--bg-3:#1a0e35;--sakura:#ffb7d5;--sakura-bright:#ffd6e8;--lavender:#c4a7e7;--gold:#ffd966;--gold-bright:#ffe89a;--mint:#7ef0b4;--ruby:#ff5c7a;--cyan:#6ee7ff;--text:#fff5eb;--text-dim:#a89cbd;--muted:#5e4d75;--border:rgba(255,183,213,0.10);--border-strong:rgba(255,183,213,0.26)}
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html{height:100%;height:100dvh;overflow:hidden;-webkit-text-size-adjust:100%;text-size-adjust:100%}
-body{
-  height:100%;height:100dvh;overflow:hidden;position:fixed;inset:0;
-  background:var(--bg-0);color:var(--text);
-  font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Yu Gothic","Noto Sans JP","Inter","Segoe UI",system-ui,sans-serif;
-  -webkit-font-smoothing:antialiased;user-select:none;
-  touch-action:manipulation;overscroll-behavior:none;
-}
+body{height:100%;height:100dvh;overflow:hidden;position:fixed;inset:0;background:var(--bg-0);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Yu Gothic","Noto Sans JP","Inter","Segoe UI",system-ui,sans-serif;-webkit-font-smoothing:antialiased;user-select:none;touch-action:manipulation;overscroll-behavior:none}
 #particles{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:0.85}
 .orb{position:fixed;border-radius:50%;filter:blur(80px);opacity:0.5;pointer-events:none;z-index:0;animation:orbFloat 18s ease-in-out infinite}
-.orb-1{width:340px;height:340px;top:-10%;left:-10%;background:radial-gradient(circle,#ffb7d5,transparent 70%);animation-delay:0s}
+.orb-1{width:340px;height:340px;top:-10%;left:-10%;background:radial-gradient(circle,#ffb7d5,transparent 70%)}
 .orb-2{width:380px;height:380px;bottom:-15%;right:-15%;background:radial-gradient(circle,#c4a7e7,transparent 70%);animation-delay:-6s}
 .orb-3{width:280px;height:280px;top:40%;left:60%;background:radial-gradient(circle,#6ee7ff,transparent 70%);animation-delay:-12s}
 @keyframes orbFloat{0%,100%{transform:translate(0,0) scale(1)}25%{transform:translate(30px,-40px) scale(1.1)}50%{transform:translate(-20px,30px) scale(0.95)}75%{transform:translate(40px,20px) scale(1.05)}}
@@ -1140,22 +1204,10 @@ body{
 @keyframes scan{0%{top:0}100%{top:100vh}}
 #app{position:absolute;inset:0;z-index:1;display:flex;flex-direction:column;overflow:hidden}
 .screen{flex:1;display:flex;flex-direction:column;overflow:hidden;min-height:0}
-.glass{
-  background:linear-gradient(135deg,rgba(28,15,56,0.75),rgba(10,6,24,0.9));
-  backdrop-filter:blur(30px) saturate(180%);-webkit-backdrop-filter:blur(30px) saturate(180%);
-  border:1px solid var(--border);border-radius:20px;
-  box-shadow:0 25px 60px -20px rgba(0,0,0,0.7),0 0 60px -25px rgba(255,183,213,0.25),inset 0 1px 0 rgba(255,255,255,0.06);
-}
+.glass{background:linear-gradient(135deg,rgba(28,15,56,0.75),rgba(10,6,24,0.9));backdrop-filter:blur(30px) saturate(180%);-webkit-backdrop-filter:blur(30px) saturate(180%);border:1px solid var(--border);border-radius:20px;box-shadow:0 25px 60px -20px rgba(0,0,0,0.7),0 0 60px -25px rgba(255,183,213,0.25),inset 0 1px 0 rgba(255,255,255,0.06)}
 @property --angle{syntax:'<angle>';initial-value:0deg;inherits:false}
-.neon::before{
-  content:'';position:absolute;inset:-1px;border-radius:inherit;padding:1px;
-  background:conic-gradient(from var(--angle),transparent 0%,var(--sakura) 25%,var(--gold) 50%,var(--lavender) 75%,transparent 100%);
-  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
-  -webkit-mask-composite:xor;mask-composite:exclude;
-  animation:spin 6s linear infinite;pointer-events:none;
-}
+.neon::before{content:'';position:absolute;inset:-1px;border-radius:inherit;padding:1px;background:conic-gradient(from var(--angle),transparent 0%,var(--sakura) 25%,var(--gold) 50%,var(--lavender) 75%,transparent 100%);-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude;animation:spin 6s linear infinite;pointer-events:none}
 @keyframes spin{to{--angle:360deg}}
-
 .login-wrap{flex:1;display:flex;align-items:center;justify-content:center;padding:20px;overflow-y:auto}
 .login-card{width:100%;max-width:400px;position:relative;padding:36px 26px 30px;animation:popIn 0.7s cubic-bezier(0.34,1.56,0.64,1)}
 @keyframes popIn{from{opacity:0;transform:scale(0.9) translateY(40px);filter:blur(10px)}to{opacity:1;transform:scale(1) translateY(0);filter:blur(0)}}
@@ -1185,7 +1237,6 @@ body{
 @keyframes fadeDown{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
 .login-foot{margin-top:20px;text-align:center;font-size:10px;color:var(--muted);line-height:1.8}
 .login-foot b{color:var(--sakura)}
-
 .info-wrap{flex:1;display:flex;align-items:center;justify-content:center;padding:20px;overflow-y:auto}
 .info-card{width:100%;max-width:380px;position:relative;padding:34px 24px 26px;animation:popIn 0.7s cubic-bezier(0.34,1.56,0.64,1)}
 .info-close{position:absolute;top:12px;right:12px;width:34px;height:34px;border-radius:50%;background:rgba(255,92,122,0.15);border:1px solid rgba(255,92,122,0.4);color:var(--ruby);font-size:16px;font-weight:900;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.3s;font-family:inherit}
@@ -1200,7 +1251,6 @@ body{
 .info-stat .lbl{font-size:11px;color:var(--text-dim);font-weight:700;letter-spacing:0.5px}
 .info-stat .val{font-size:15px;font-weight:900;color:var(--gold-bright);font-family:monospace;overflow-wrap:anywhere;text-align:right}
 .info-stat .val.small{font-size:11px;color:var(--sakura);letter-spacing:1px}
-
 .setup-wrap{flex:1;display:flex;align-items:center;justify-content:center;padding:20px;overflow-y:auto}
 .setup-card{width:100%;max-width:380px;position:relative;padding:32px 24px 26px;animation:popIn 0.7s cubic-bezier(0.34,1.56,0.64,1)}
 .setup-back{position:absolute;top:12px;left:12px;padding:6px 12px;border-radius:20px;background:rgba(255,183,213,0.1);border:1px solid var(--border);color:var(--text-dim);font-size:10px;font-weight:800;cursor:pointer;font-family:inherit;letter-spacing:1px;transition:all 0.2s}
@@ -1210,7 +1260,6 @@ body{
 .setup-sub{font-size:11px;text-align:center;color:var(--text-dim);line-height:1.6;margin-bottom:22px}
 .setup-hint{font-size:10px;color:var(--text-dim);background:rgba(255,183,213,0.06);border:1px solid rgba(255,183,213,0.15);border-radius:10px;padding:12px 14px;margin-top:16px;line-height:1.7;text-align:left}
 .setup-hint b{color:var(--sakura)}
-
 .main-header{flex-shrink:0;display:flex;align-items:center;gap:12px;padding:12px 16px;margin:12px 12px 0;position:relative}
 .main-logo{width:44px;height:44px;border-radius:50%;object-fit:cover;border:1.5px solid var(--sakura);box-shadow:0 0 20px rgba(255,183,213,0.35);flex-shrink:0;background:var(--bg-2)}
 .main-brand{flex:1;min-width:0}
@@ -1222,11 +1271,9 @@ body{
 .action-btn.kill:hover{background:rgba(255,92,122,0.25);transform:scale(1.1)}
 .action-btn.logout{color:var(--gold);border-color:rgba(255,217,102,0.35);background:rgba(255,217,102,0.1)}
 .action-btn.logout:hover{background:rgba(255,217,102,0.25);transform:scale(1.1)}
-
 .main-scroll{flex:1;overflow-y:auto;overflow-x:hidden;padding:14px 12px 96px;scrollbar-width:thin;scrollbar-color:rgba(255,183,213,0.3) transparent}
 .main-scroll::-webkit-scrollbar{width:4px}
 .main-scroll::-webkit-scrollbar-thumb{background:rgba(255,183,213,0.3);border-radius:2px}
-
 .balance-card{padding:22px;margin-bottom:14px;position:relative;animation:slideIn 0.5s cubic-bezier(0.34,1.56,0.64,1) 0.05s both}
 @keyframes slideIn{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
 .balance-label{font-size:9px;letter-spacing:2px;color:var(--text-dim);font-weight:800;text-transform:uppercase;margin-bottom:8px;display:flex;align-items:center;gap:6px}
@@ -1234,7 +1281,6 @@ body{
 .balance-value{font-size:34px;font-weight:900;color:var(--gold-bright);font-family:"SF Mono","Consolas",monospace;letter-spacing:1px;line-height:1;text-shadow:0 0 24px rgba(255,217,102,0.5);transition:all 0.3s;display:inline-block}
 .balance-value.updating{transform:scale(1.06);color:var(--mint);text-shadow:0 0 30px rgba(126,240,180,0.7)}
 .balance-suffix{font-size:18px;color:var(--text-dim);margin-left:6px;text-shadow:none}
-
 .result-card{padding:32px 20px 26px;margin-bottom:14px;position:relative;text-align:center;animation:slideIn 0.5s cubic-bezier(0.34,1.56,0.64,1) 0.15s both;min-height:280px;display:flex;flex-direction:column;align-items:center;justify-content:center}
 .result-session{font-size:10px;letter-spacing:2px;color:var(--text-dim);font-weight:800;text-transform:uppercase;margin-bottom:16px}
 .result-label{font-size:11px;color:var(--text-dim);letter-spacing:3px;font-weight:700;text-transform:uppercase;margin-bottom:14px}
@@ -1255,7 +1301,6 @@ body{
 .result-outcome .big.jackpot{background:linear-gradient(90deg,#fff,#ffd966,#fff,#ffb300,#fff);background-size:300% 100%;-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;animation:shimmer 2s linear infinite;text-shadow:none;filter:drop-shadow(0 0 20px rgba(255,217,102,0.8))}
 .result-outcome .detail{font-size:12px;color:var(--text-dim);font-family:"SF Mono",monospace;letter-spacing:0.5px;line-height:1.7}
 .result-outcome .detail b{color:var(--gold-bright)}
-
 .bet-card{padding:18px 20px;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;gap:14px;position:relative;animation:slideIn 0.5s cubic-bezier(0.34,1.56,0.64,1) 0.25s both;background:linear-gradient(135deg,rgba(255,183,213,0.1),rgba(28,15,56,0.85))}
 .bet-label{font-size:10px;letter-spacing:2px;color:var(--text-dim);font-weight:800;text-transform:uppercase;margin-bottom:6px;display:flex;align-items:center;gap:6px}
 .bet-label::before{content:'💎'}
@@ -1265,7 +1310,6 @@ body{
 .bet-streak{text-align:right}
 .bet-streak small{font-size:9px;color:var(--text-dim);letter-spacing:1px;font-weight:700;text-transform:uppercase;display:block}
 .bet-streak b{font-size:15px;font-weight:900;font-family:"SF Mono",monospace;display:block;margin-top:2px;color:var(--sakura)}
-
 .progress-card{padding:16px 20px;margin-bottom:14px;position:relative;animation:slideIn 0.5s cubic-bezier(0.34,1.56,0.64,1) 0.35s both}
 .progress-label{display:flex;justify-content:space-between;font-size:10px;font-weight:800;letter-spacing:1px;margin-bottom:8px;color:var(--text-dim);align-items:center;gap:8px}
 .progress-label b{color:var(--gold-bright);font-family:"SF Mono",monospace}
@@ -1273,11 +1317,9 @@ body{
 .progress-fill{height:100%;background:linear-gradient(90deg,var(--sakura),var(--gold),var(--mint));border-radius:5px;transition:width 0.6s cubic-bezier(0.34,1.56,0.64,1);box-shadow:0 0 14px rgba(255,183,213,0.7);position:relative;overflow:hidden}
 .progress-fill::after{content:'';position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,0.5),transparent);animation:progressShimmer 2s linear infinite}
 @keyframes progressShimmer{from{transform:translateX(-100%)}to{transform:translateX(100%)}}
-
 .bottom-nav{position:absolute;bottom:0;left:0;right:0;padding:10px 20px 14px;display:flex;justify-content:center;gap:8px;background:linear-gradient(180deg,rgba(5,2,15,0.3),rgba(5,2,15,0.98) 40%);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border-top:1px solid var(--border);z-index:10}
 .nav-btn{flex:1;max-width:180px;padding:12px 16px;background:rgba(28,15,56,0.7);border:1px solid var(--border);color:var(--text-dim);font-size:11px;font-weight:800;letter-spacing:1px;border-radius:14px;cursor:pointer;transition:all 0.25s;display:flex;align-items:center;justify-content:center;gap:6px;font-family:inherit;text-transform:uppercase}
 .nav-btn.on{background:linear-gradient(135deg,var(--sakura-bright),var(--sakura));color:#1a0d33;border-color:transparent;box-shadow:0 6px 20px -6px rgba(255,183,213,0.6)}
-
 .history-header{flex-shrink:0;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;margin:12px 12px 0}
 .history-title{font-size:14px;font-weight:900;color:var(--sakura);letter-spacing:2px;text-transform:uppercase}
 .history-count{font-size:10px;color:var(--text-dim);font-weight:700;padding:4px 10px;background:rgba(255,183,213,0.1);border-radius:20px;border:1px solid var(--border)}
@@ -1295,22 +1337,18 @@ body{
 .hist-amount{font-family:"SF Mono",monospace;font-weight:900;font-size:13px;min-width:76px;text-align:right}
 .hist-amount.win{color:var(--mint)}
 .hist-amount.lose{color:var(--ruby)}
-
 .empty-state{padding:60px 20px;text-align:center;color:var(--text-dim);font-size:12px}
 .empty-state .icon{font-size:52px;margin-bottom:16px;opacity:0.4;display:block}
 .empty-state .title{font-size:14px;font-weight:800;color:var(--text);margin-bottom:6px}
 .empty-state .sub{font-size:11px;color:var(--muted)}
-
 #toast{position:fixed;top:20px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:8px;pointer-events:none;max-width:340px}
 .toast{padding:12px 18px;border-radius:12px;font-size:12px;font-weight:600;color:#fff;background:rgba(28,15,56,0.98);border:1px solid var(--border-strong);box-shadow:0 12px 32px -8px rgba(0,0,0,0.6);backdrop-filter:blur(12px);animation:toastIn 0.35s cubic-bezier(0.34,1.56,0.64,1)}
 .toast.success{border-color:rgba(126,240,180,0.4)}
 .toast.error{border-color:rgba(255,92,122,0.4)}
 .toast.gold{border-color:rgba(255,217,102,0.4)}
 @keyframes toastIn{from{opacity:0;transform:translateX(100px)}to{opacity:1;transform:translateX(0)}}
-
 .sparkle{position:fixed;width:5px;height:5px;border-radius:50%;pointer-events:none;z-index:9998;animation:sparkleAnim 0.9s ease-out forwards;box-shadow:0 0 10px currentColor,0 0 20px currentColor}
 @keyframes sparkleAnim{0%{transform:translate(0,0) scale(1);opacity:1}100%{transform:translate(var(--dx),var(--dy)) scale(0);opacity:0}}
-
 .jackpot-overlay{position:fixed;inset:0;z-index:99999;display:none;align-items:center;justify-content:center;background:radial-gradient(circle at center,rgba(255,215,0,0.55),rgba(20,10,40,0.96) 70%);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);overflow:hidden}
 .jackpot-overlay.show{display:flex;animation:jackpotFadeIn 0.4s ease-out}
 @keyframes jackpotFadeIn{from{opacity:0}to{opacity:1}}
@@ -1329,20 +1367,8 @@ body{
 .jackpot-coins{position:absolute;inset:0;pointer-events:none;overflow:hidden}
 .coin{position:absolute;font-size:32px;animation:coinFall linear forwards;filter:drop-shadow(0 0 10px #ffd966)}
 @keyframes coinFall{0%{transform:translateY(-100px) rotate(0);opacity:0}10%{opacity:1}100%{transform:translateY(105vh) rotate(720deg);opacity:0}}
-
-@media (max-width:360px){
-  .login-card,.info-card,.setup-card{padding:26px 18px}
-  .logo-img{width:90px;height:90px}
-  .brand-title{font-size:20px;letter-spacing:3px}
-  .result-prediction{font-size:54px}
-  .balance-value{font-size:28px}
-  .jackpot-text{font-size:44px;letter-spacing:4px}
-  .jackpot-icon{font-size:60px}
-  .jackpot-sub{font-size:16px;letter-spacing:4px}
-}
-@media (prefers-reduced-motion:reduce){
-  .orb,.logo-img,.brand-title,.result-prediction,.hist-row,.scanline,.pred-rings::before,.pred-rings::after,.jackpot-rays,.jackpot-icon,.jackpot-text{animation:none!important}
-}
+@media (max-width:360px){.login-card,.info-card,.setup-card{padding:26px 18px}.logo-img{width:90px;height:90px}.brand-title{font-size:20px;letter-spacing:3px}.result-prediction{font-size:54px}.balance-value{font-size:28px}.jackpot-text{font-size:44px;letter-spacing:4px}.jackpot-icon{font-size:60px}.jackpot-sub{font-size:16px;letter-spacing:4px}}
+@media (prefers-reduced-motion:reduce){.orb,.logo-img,.brand-title,.result-prediction,.hist-row,.scanline,.pred-rings::before,.pred-rings::after,.jackpot-rays,.jackpot-icon,.jackpot-text{animation:none!important}}
 </style>
 </head>
 <body>
@@ -1355,7 +1381,7 @@ body{
 <div id="toast"></div>
 <script>
 const LOGO_URL = 'https://raw.githubusercontent.com/nguyenha783255-wq/LOGO-LC79/main/IMG_20260901_094944_094.jpg';
-const LS_KEY = 'denius_v9';
+const LS_KEY = 'denius_v91';
 const app = document.getElementById('app');
 const toastBox = document.getElementById('toast');
 
@@ -1389,23 +1415,14 @@ const S = {
     particles = [];
     const count = window.innerWidth < 600 ? 40 : 70;
     for (let i = 0; i < count; i++) {
-      particles.push({
-        x: Math.random() * canvas.width,
-        y: Math.random() * canvas.height,
-        vx: (Math.random() - 0.5) * 0.35,
-        vy: (Math.random() - 0.5) * 0.35,
-        r: Math.random() * 2.5 + 0.5,
-        color: colors[Math.floor(Math.random() * colors.length)],
-        alpha: Math.random() * 0.5 + 0.2,
-      });
+      particles.push({x:Math.random()*canvas.width,y:Math.random()*canvas.height,vx:(Math.random()-0.5)*0.35,vy:(Math.random()-0.5)*0.35,r:Math.random()*2.5+0.5,color:colors[Math.floor(Math.random()*colors.length)],alpha:Math.random()*0.5+0.2});
     }
   }
   function animate() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     for (let i = 0; i < particles.length; i++) {
       const p = particles[i];
-      p.x += p.vx;
-      p.y += p.vy;
+      p.x += p.vx; p.y += p.vy;
       if (p.x < 0 || p.x > canvas.width) p.vx *= -1;
       if (p.y < 0 || p.y > canvas.height) p.vy *= -1;
       ctx.globalAlpha = p.alpha;
@@ -1488,16 +1505,12 @@ function showJackpotOverlay(h) {
         '<div class="jackpot-detail" id="jackpot-detail"></div>' +
       '</div>';
     document.body.appendChild(overlay);
-    document.getElementById('jackpot-close').onclick = () => {
-      overlay.classList.remove('show');
-    };
+    document.getElementById('jackpot-close').onclick = () => { overlay.classList.remove('show'); };
   }
   const dice = (h.dices || []).join(' - ');
   const delta = '+' + fmt(Math.floor(h.amount * 0.98));
   const detail = document.getElementById('jackpot-detail');
-  if (detail) {
-    detail.innerHTML = '🎲 ' + dice + '<br>💰 ' + delta + 'đ';
-  }
+  if (detail) detail.innerHTML = '🎲 ' + dice + '<br>💰 ' + delta + 'đ';
   overlay.classList.add('show');
   const coins = document.getElementById('jackpot-coins');
   if (coins) {
@@ -1512,19 +1525,11 @@ function showJackpotOverlay(h) {
       coins.appendChild(c);
     }
   }
-  setTimeout(() => {
-    if (overlay.classList.contains('show')) {
-      overlay.classList.remove('show');
-    }
-  }, 8000);
+  setTimeout(() => { if (overlay.classList.contains('show')) overlay.classList.remove('show'); }, 8000);
 }
 
-function saveAuth(u, t, n) {
-  try { localStorage.setItem(LS_KEY, JSON.stringify({u:u, t:t, n:n, ts: Date.now()})); } catch(e) {}
-}
-function loadAuth() {
-  try { const j = localStorage.getItem(LS_KEY); return j ? JSON.parse(j) : null; } catch(e) { return null; }
-}
+function saveAuth(u, t, n) { try { localStorage.setItem(LS_KEY, JSON.stringify({u, t, n, ts: Date.now()})); } catch(e) {} }
+function loadAuth() { try { const j = localStorage.getItem(LS_KEY); return j ? JSON.parse(j) : null; } catch(e) { return null; } }
 function clearAuth() { try { localStorage.removeItem(LS_KEY); } catch(e) {} }
 
 function getModeInfo() {
@@ -1538,10 +1543,7 @@ function render() {
   else if (S.step === 'info') renderInfo();
   else if (S.step === 'base_bet') renderBaseBet();
   else if (S.step === 'target') renderTarget();
-  else if (S.step === 'main') {
-    if (S.tab === 'history') renderHistory();
-    else renderMain();
-  }
+  else if (S.step === 'main') { if (S.tab === 'history') renderHistory(); else renderMain(); }
 }
 
 function renderLogin() {
@@ -1549,12 +1551,12 @@ function renderLogin() {
     '<div class="screen"><div class="login-wrap"><div class="login-card glass neon" style="position:relative">' +
       '<div class="logo-wrap"><img src="' + LOGO_URL + '" class="logo-img" onerror="this.style.display=\'none\'"></div>' +
       '<div class="brand-title">DENIUS</div>' +
-      '<div class="brand-sub"><span class="jp">お兄ちゃん</span> · CÔNG THỨC CHUẨN v9</div>' +
+      '<div class="brand-sub"><span class="jp">お兄ちゃん</span> · CÔNG THỨC CHUẨN v9.1</div>' +
       '<div class="field"><label>👤 TÀI KHOẢN</label><input id="in_u" type="text" placeholder="Nhập tài khoản..." value="' + esc(S.user) + '"></div>' +
       '<div class="field"><label>🔒 MẬT KHẨU</label><input id="in_p" type="password" placeholder="••••••••"></div>' +
       '<button class="btn btn-sakura" id="btn_login"' + (S.loading ? ' disabled' : '') + '>' + (S.loading ? 'ĐANG XÁC THỰC' : 'ĐĂNG NHẬP') + '</button>' +
       (S.error ? '<div class="msg err">⚠️ ' + esc(S.error) + '</div>' : '') +
-      '<div class="login-foot"><b>V9.0 CÔNG THỨC</b> · Admin <b>@DENIUS09</b></div>' +
+      '<div class="login-foot"><b>V9.1 CÔNG THỨC</b> · Admin <b>@DENIUS09</b></div>' +
     '</div></div></div>';
   const btn = document.getElementById('btn_login');
   btn.onclick = doLogin;
@@ -1571,10 +1573,7 @@ async function doLogin() {
   try {
     const r = await api('verify', {user:u, pass:p, device:S.device});
     if (!r.ok) { S.loading = false; S.error = r.msg || 'Đăng nhập thất bại'; render(); return; }
-    Object.assign(S, {
-      user:r.user, nickname:r.nickname, balance:r.balance, config:r.config,
-      history:r.history || [], authToken:r.auth_token, workerAlive:!!r.worker_alive, loading:false,
-    });
+    Object.assign(S, {user:r.user, nickname:r.nickname, balance:r.balance, config:r.config, history:r.history || [], authToken:r.auth_token, workerAlive:!!r.worker_alive, loading:false});
     saveAuth(r.user, r.auth_token, r.nickname);
     if (S.config.onboarded && S.config.base_bet > 0) S.step = 'main';
     else S.step = 'info';
@@ -1582,9 +1581,7 @@ async function doLogin() {
     render();
     startTick();
     toast('Chào Ông Chủ ' + r.nickname, 'gold');
-  } catch (e) {
-    S.loading = false; S.error = 'Lỗi: ' + e.message; render();
-  }
+  } catch (e) { S.loading = false; S.error = 'Lỗi: ' + e.message; render(); }
 }
 
 async function tryResume() {
@@ -1593,12 +1590,7 @@ async function tryResume() {
   try {
     const r = await api('resume', {user:saved.u, auth_token:saved.t});
     if (!r.ok) { clearAuth(); render(); return; }
-    Object.assign(S, {
-      user:r.user, nickname:r.nickname, balance:r.balance, config:r.config,
-      history:r.history || [], authToken:r.auth_token, workerAlive:!!r.worker_alive,
-      pendingPred:r.pending_pred, pendingSession:r.pending_session,
-      pendingBetAmount:r.pending_bet_amount,
-    });
+    Object.assign(S, {user:r.user, nickname:r.nickname, balance:r.balance, config:r.config, history:r.history || [], authToken:r.auth_token, workerAlive:!!r.worker_alive, pendingPred:r.pending_pred, pendingSession:r.pending_session, pendingBetAmount:r.pending_bet_amount});
     if (S.config.onboarded && S.config.base_bet > 0) S.step = 'main';
     else S.step = 'info';
     S.tab = 'main';
@@ -1669,7 +1661,7 @@ function renderTarget() {
       '<div class="field"><label>🎯 MỤC TIÊU (VNĐ)</label><input id="in_target" type="number" inputmode="numeric" value="' + val + '" min="10000" step="10000"></div>' +
       '<button class="btn btn-sakura" id="btn_start"' + (S.loading ? ' disabled' : '') + '>' + (S.loading ? 'ĐANG KHỞI ĐỘNG' : '🚀 BẮT ĐẦU AUTO') + '</button>' +
       (S.error ? '<div class="msg err">⚠️ ' + esc(S.error) + '</div>' : '') +
-      '<div class="setup-hint">⚙️ <b>Công thức DENIUS:</b><br>A = dice1(phiên trước) + lastDigit(phiên trước)<br>B = tổng xúc xắc phiên (trước − 22)<br>K = |A−B|, final = K−2 nếu B&gt;A<br>final=4 → BỎ TAY · final=5 → theo trước · final&lt;10 → bẻ<br>Bệt + dự đoán bẻ → K parity<br>💰 Gấp thếp X2 khi thua</div>' +
+      '<div class="setup-hint">⚙️ <b>Công thức DENIUS:</b><br>A = dice1(prev) + lastDigit(id prev)<br>B = tổng dice phiên (prev − 22)<br>K = |A−B|, final = K−2 nếu B&gt;A<br>final=4 → BỎ TAY · final=5 → theo prev · final&lt;10 → bẻ<br>Bệt + pred bẻ → K parity (K chẵn TÀI / K lẻ XỈU)<br>💰 Gấp thếp X2 khi thua</div>' +
     '</div></div></div>';
   const inp = document.getElementById('in_target');
   inp.focus(); inp.select();
@@ -1688,10 +1680,7 @@ function renderTarget() {
 async function startAuto() {
   S.loading = true; render();
   try {
-    const r = await api('setup', {
-      user:S.user, base_bet:S.setupBaseBet,
-      profit_stop:S.setupTarget,
-    });
+    const r = await api('setup', {user:S.user, base_bet:S.setupBaseBet, profit_stop:S.setupTarget});
     if (!r.ok) { S.loading = false; S.error = r.msg || 'Không thể bắt đầu'; render(); return; }
     S.config = r.config;
     S.loading = false;
@@ -1808,8 +1797,7 @@ function renderHistory() {
     body = '<div class="empty-state"><span class="icon">🌸</span><div class="title">Chưa có lịch sử</div><div class="sub">Bắt đầu AUTO để ghi nhận</div></div>';
   } else {
     body = hist.slice(0, 100).map((h, idx) => {
-      let cls = 'lose';
-      let delta = '-' + fmt(h.amount);
+      let cls = 'lose', delta = '-' + fmt(h.amount);
       if (h.win) { cls = 'win'; delta = '+' + fmt(Math.floor(h.amount * 0.98)); }
       const jp = h.jackpot ? 'jackpot' : '';
       const dice = (h.dices || []).join('-');
@@ -1864,8 +1852,7 @@ function animateNumber(el, from, to) {
   function frame(now) {
     const p = Math.min(1, (now - start) / dur);
     const ease = 1 - Math.pow(1 - p, 3);
-    const val = Math.round(from + (to - from) * ease);
-    el.textContent = fmt(val);
+    el.textContent = fmt(Math.round(from + (to - from) * ease));
     if (p < 1) requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);
@@ -1900,11 +1887,9 @@ async function tick() {
     }
     if (S.history.length > oldHistLen && oldHistLen > 0) {
       const newEntry = S.history[0];
-      if (newEntry && newEntry.jackpot) {
-        if (S.lastJackpotSession !== newEntry.session) {
-          S.lastJackpotSession = newEntry.session;
-          setTimeout(() => showJackpotOverlay(newEntry), 300);
-        }
+      if (newEntry && newEntry.jackpot && S.lastJackpotSession !== newEntry.session) {
+        S.lastJackpotSession = newEntry.session;
+        setTimeout(() => showJackpotOverlay(newEntry), 300);
       }
     }
     lastHistLen = S.history.length;
@@ -1966,8 +1951,7 @@ async function tick() {
         if (hl.dataset.keys !== keys) {
           hl.dataset.keys = keys;
           hl.innerHTML = S.history.slice(0, 100).map((h, idx) => {
-            let cls = 'lose';
-            let delta = '-' + fmt(h.amount);
+            let cls = 'lose', delta = '-' + fmt(h.amount);
             if (h.win) { cls = 'win'; delta = '+' + fmt(Math.floor(h.amount * 0.98)); }
             const jp = h.jackpot ? 'jackpot' : '';
             const dice = (h.dices || []).join('-');
