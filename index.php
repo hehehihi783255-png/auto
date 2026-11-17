@@ -1,26 +1,20 @@
 <?php
 /**
- * DENIUS AUTO v9.2 — BULLETPROOF WORKER + DEBUG
- * Fixes:
- *  1. Settle chỉ khi bet_session được set (không tính lãi/lỗ giả)
- *  2. Force spawn worker mới trên setup (kill cũ trước)
- *  3. Log từng bước [V92] để user biết fail ở đâu
- *  4. Debug endpoints: /debug, /test_ws, /force_bet
- *  5. WS bet timeout 8s (thay vì 20s) để retry nhanh
- *  6. Save last_ws_error vào state để user xem
+ * DENIUS AUTO v9.2-MD5 — Bàn MD5 (wtxmd52.tele68.com)
+ * Chỉ đổi kết nối từ HŨ → MD5, giữ nguyên 100% logic công thức
  */
 
 $CFG = [
     'game' => [
         'login_url'    => 'https://apifo88daigia.tele68.com/api?c=3&un={USER}&pw={PASS_MD5}&cp=R&cl=R&pf=web&at=',
         'lobby_url'    => 'https://wlb.tele68.com/v1/lobby/auth/login?cp=R&cl=R&pf=web&at=',
-        'ws_host'      => 'wtx.tele68.com',
-        'ws_path'      => '/tx/',
-        'sessions_api' => 'https://wtx.tele68.com/v1/tx/sessions',
+        'ws_host'      => 'wtxmd52.tele68.com',
+        'ws_path'      => '/txmd5/',
+        'sessions_api' => 'https://wtxmd52.tele68.com/v1/txmd5/sessions',
         'b_offset'     => 22,
     ],
     'security' => [
-        'hmac_secret' => 'DENIUS_v92_BULLETPROOF_HMAC',
+        'hmac_secret' => 'DENIUS_v92_MD5_HMAC',
         'session_ttl' => 2592000,
     ],
     'worker' => [
@@ -160,7 +154,7 @@ function denius_detect_jackpot(array $found, array $dices): bool {
     return false;
 }
 
-// ═══════ FORMULA v9.2 ═══════
+// ═══════ FORMULA ═══════
 function denius_map_result(string $raw): ?string {
     $map = ['Tài'=>'TAI','Xỉu'=>'XIU','tai'=>'TAI','xiu'=>'XIU','TAI'=>'TAI','XIU'=>'XIU','TÀI'=>'TAI','XỈU'=>'XIU'];
     return $map[$raw] ?? null;
@@ -190,7 +184,6 @@ function denius_compute(array $sessions, int $latestId): array {
         'bExact'=>false, 'bWanted'=>$latestId - $bOffset, 'bActual'=>0,
         'reason'=>'Không đủ dữ liệu',
     ];
-
     $prev = denius_find_session($sessions, $latestId);
     if (!$prev) { $out['reason'] = 'Không tìm phiên #'.$latestId; return $out; }
     $prevSide = denius_map_result((string)($prev['resultTruyenThong'] ?? ''));
@@ -200,21 +193,18 @@ function denius_compute(array $sessions, int $latestId): array {
     $dice1 = (int)($dices[0] ?? 0);
     $A = $dice1 + ($latestId % 10);
 
-    // Tìm B
     $bRow = denius_find_session($sessions, $latestId - $bOffset);
     if ($bRow) {
         $out['bExact'] = true;
         $out['bActual'] = $latestId - $bOffset;
     } else {
-        // Fallback: phiên xa nhất có trong list
         $minId = PHP_INT_MAX; $furthest = null;
         foreach ($sessions as $row) {
             $id = (int)$row['id'];
             if ($id < $latestId && $id < $minId) { $minId = $id; $furthest = $row; }
         }
         if (!$furthest) { $out['A'] = $A; $out['prevResult'] = $prevSide;
-            $out['reason'] = 'Không có phiên B (#'.$out['bWanted'].') và không có phiên xa hơn';
-            return $out; }
+            $out['reason'] = 'Không có phiên B'; return $out; }
         $bRow = $furthest;
         $out['bActual'] = $minId;
     }
@@ -234,11 +224,10 @@ function denius_compute(array $sessions, int $latestId): array {
     elseif ($final >= 10) { $pred = ($final % 2 === 0) ? 'XIU' : 'TAI'; $reason = 'final≥10 ('.$final.')'; }
     else { $pred = ($prevSide === 'TAI') ? 'XIU' : 'TAI'; $reason = 'Bẻ prev (final='.$final.')'; }
 
-    // Bẻ bệt check
     if (!$skip && $streakInfo['len'] >= 2 && $streakInfo['side'] !== null && $pred !== null) {
         if ($pred !== $streakInfo['side']) {
             $pred = ($K % 2 === 0) ? 'TAI' : 'XIU';
-            $reason .= ' | BẺ BỆT: K='.$K.' (chẵn TÀI/lẻ XỈU) → '.$pred;
+            $reason .= ' | BẺ BỆT: K='.$K.' → '.$pred;
         } else {
             $reason .= ' | Đang bệt '.$streakInfo['side'].' → giữ';
         }
@@ -331,7 +320,7 @@ class TinyWS {
     public function close(): void { if ($this->sock) @fclose($this->sock); $this->sock = null; }
 }
 
-// ═══════ WS BET v9.2 — RETURNS DIAGNOSTIC ═══════
+// ═══════ WS BET — MD5 NAMESPACE (/txmd5) ═══════
 function do_ws_bet(string $key, array $s, array &$actions): array {
     global $CFG;
     if (empty($s['token'])) return ['ok'=>false, 'reason'=>'Missing token'];
@@ -349,7 +338,7 @@ function do_ws_bet(string $key, array $s, array &$actions): array {
         key_log($key, 'error', '[V92-WS] ❌ Connect fail: ' . $ws->error);
         return ['ok'=>false, 'reason'=>'Connect: '.$ws->error];
     }
-    key_log($key, 'info', '[V92-WS] ✅ Connected, sending auth');
+    key_log($key, 'info', '[V92-WS] ✅ Connected MD5, sending auth');
 
     $auth = json_encode(['token'=>$s['token']], JSON_UNESCAPED_UNICODE);
     $stage = 'wait_open';
@@ -370,8 +359,9 @@ function do_ws_bet(string $key, array $s, array &$actions): array {
 
             if (str_starts_with($pkt, '0{')) {
                 $stage = 'auth_sent';
-                $ws->sendRaw('40/tx,' . $auth);
-                key_log($key, 'info', '[V92-WS] 📤 Sent auth');
+                // MD5 namespace: 40/txmd5,
+                $ws->sendRaw('40/txmd5,' . $auth);
+                key_log($key, 'info', '[V92-WS] 📤 Sent auth → /txmd5');
                 continue;
             }
             if ($pkt === '2') { $ws->sendRaw('3'); continue; }
@@ -384,10 +374,11 @@ function do_ws_bet(string $key, array $s, array &$actions): array {
             if (!str_starts_with($pkt, '4')) continue;
             $sio = substr($pkt, 1);
 
-            if (str_starts_with($sio, '0/tx,')) {
+            // MD5 join: 0/txmd5,
+            if (str_starts_with($sio, '0/txmd5,')) {
                 $stage = 'joined';
                 $joined = true;
-                key_log($key, 'info', '[V92-WS] ✅ Joined namespace /tx');
+                key_log($key, 'info', '[V92-WS] ✅ Joined namespace /txmd5');
                 continue;
             }
             if (str_starts_with($sio, '1')) { $ws->close(); return ['ok'=>false, 'reason'=>'SIO disconnect']; }
@@ -395,7 +386,8 @@ function do_ws_bet(string $key, array $s, array &$actions): array {
             if (!str_starts_with($sio, '2')) continue;
 
             $body = substr($sio, 1);
-            if (str_starts_with($body, '/tx,')) $body = substr($body, strlen('/tx,'));
+            // MD5 body prefix: /txmd5,
+            if (str_starts_with($body, '/txmd5,')) $body = substr($body, strlen('/txmd5,'));
             $msg = json_decode($body, true);
             if (!is_array($msg) || count($msg) < 1) continue;
             $ev = $msg[0] ?? ''; $d = $msg[1] ?? [];
@@ -411,16 +403,16 @@ function do_ws_bet(string $key, array $s, array &$actions): array {
                     if ($tickSid !== null && $tickSid < $ps) continue;
                     $sawBetting = true;
                     $stage = 'bet_sent';
-                    $ws->sendRaw('42/tx,' . json_encode(['bet', ['type'=>$side, 'amount'=>$amount]], JSON_UNESCAPED_UNICODE));
+                    // MD5 event: 42/txmd5,
+                    $ws->sendRaw('42/txmd5,' . json_encode(['bet', ['type'=>$side, 'amount'=>$amount]], JSON_UNESCAPED_UNICODE));
                     $done = true;
-                    key_log($key, 'success', '[V92-WS] 💰 Bet SENT: #'.$ps.' '.$side.' '.number_format($amount));
-                    $actions[] = ['type'=>'bet', 'msg'=>"Bet #$ps $side $amount"];
+                    key_log($key, 'success', '[V92-WS] 💰 Bet SENT MD5: #'.$ps.' '.$side.' '.number_format($amount));
+                    $actions[] = ['type'=>'bet', 'msg'=>"Bet MD5 #$ps $side $amount"];
                     key_update($key, function($dd) use ($ps, $amount) {
                         $dd['bet_session'] = $ps;
                         $dd['bet_amount'] = $amount;
                         return $dd;
                     });
-                    // Chờ ack
                     $wait = microtime(true) + 2;
                     while (microtime(true) < $wait) {
                         $more = $ws->readOneFrame(1);
@@ -431,11 +423,11 @@ function do_ws_bet(string $key, array $s, array &$actions): array {
                             $s2 = substr($p2, 1);
                             if (!str_starts_with($s2, '2')) continue;
                             $b2 = substr($s2, 1);
-                            if (str_starts_with($b2, '/tx,')) $b2 = substr($b2, strlen('/tx,'));
+                            if (str_starts_with($b2, '/txmd5,')) $b2 = substr($b2, strlen('/txmd5,'));
                             $m2 = json_decode($b2, true);
                             if (!is_array($m2)) continue;
                             if (($m2[0] ?? '') === 'bet-result') {
-                                key_log($key, 'success', '[V92-WS] ✅ Bet ACK received');
+                                key_log($key, 'success', '[V92-WS] ✅ Bet ACK received MD5');
                                 if (isset($m2[1]['postBalance'])) {
                                     key_update($key, function($dd) use ($m2) { $dd['balance'] = $m2[1]['postBalance']; return $dd; });
                                 }
@@ -443,7 +435,7 @@ function do_ws_bet(string $key, array $s, array &$actions): array {
                         }
                     }
                     $ws->close();
-                    return ['ok'=>true, 'reason'=>'Bet sent + ack'];
+                    return ['ok'=>true, 'reason'=>'Bet sent + ack MD5'];
                 }
             }
             if ($ev === 'session-result') { $ws->close(); return ['ok'=>false, 'reason'=>'Session settled before bet']; }
@@ -451,12 +443,12 @@ function do_ws_bet(string $key, array $s, array &$actions): array {
     }
     $ws->close();
     $reason = 'Timeout 8s — stage='.$stage;
-    if ($joined && !$sawBetting) $reason .= ' (không bắt được BETTING state)';
+    if ($joined && !$sawBetting) $reason .= ' (không bắt được BETTING)';
     key_log($key, 'error', '[V92-WS] ❌ ' . $reason);
     return ['ok'=>false, 'reason'=>$reason];
 }
 
-// ═══════ WORKER v9.2 ═══════
+// ═══════ WORKER ═══════
 function worker_step(string $key): array {
     $actions = [];
     $s = key_load($key);
@@ -464,7 +456,6 @@ function worker_step(string $key): array {
     $cfg = $s['config'] ?? [];
     if (empty($cfg['auto']) || !empty($cfg['paused'])) return $actions;
 
-    // Check profit target
     $pTarget = (int)($cfg['profit_stop'] ?? 0);
     if ($pTarget > 0 && (int)($s['profit_total'] ?? 0) >= $pTarget && empty($s['pending_pred'])) {
         key_update($key, function($d) { $d['config']['auto'] = false; $d['config']['paused'] = true; return $d; });
@@ -475,33 +466,29 @@ function worker_step(string $key): array {
     $data = fetch_sessions_api();
     if (!$data || empty($data['list'])) {
         if (($s['last_api_fail_log'] ?? 0) < time() - 60) {
-            key_log($key, 'warn', '[V92] ⚠️ sessions API fail');
+            key_log($key, 'warn', '[V92] ⚠️ sessions API fail MD5');
             key_update($key, fn($d) => array_merge($d, ['last_api_fail_log' => time()]));
         }
         return $actions;
     }
     $sessions = $data['list'];
 
-    // Find latest settled
     $latestId = 0;
     foreach ($sessions as $row) {
         if (denius_map_result((string)($row['resultTruyenThong'] ?? '')) !== null) {
-            $latestId = (int)$row['id'];
-            break;
+            $latestId = (int)$row['id']; break;
         }
     }
-    if ($latestId === 0) { key_log($key, 'warn', '[V92] Không có phiên có KQ'); return $actions; }
+    if ($latestId === 0) { key_log($key, 'warn', '[V92] Không có phiên có KQ MD5'); return $actions; }
 
     $lastId = (int)($s['last_session_id'] ?? 0);
 
-    // Baseline
     if ($lastId === 0) {
         key_update($key, fn($d) => array_merge($d, ['last_session_id'=>$latestId]));
-        key_log($key, 'info', '[V92] 📡 Baseline #'.$latestId.' — auto sẽ tính từ phiên sau');
+        key_log($key, 'info', '[V92] 📡 Baseline MD5 #'.$latestId);
         return $actions;
     }
 
-    // Process settled sessions
     if ($latestId > $lastId) {
         for ($sid = $lastId + 1; $sid <= $latestId; $sid++) {
             $found = denius_find_session($sessions, $sid);
@@ -517,8 +504,7 @@ function worker_step(string $key): array {
                 $betPlaced = ((int)($s['bet_session'] ?? 0) === $sid);
 
                 if (!$betPlaced) {
-                    // KHÔNG settle — bet chưa được đặt
-                    key_log($key, 'error', '[V92] ⚠️ Phiên #'.$sid.' đã qua nhưng KHÔNG đặt được cược — clear pending');
+                    key_log($key, 'error', '[V92] ⚠️ Phiên MD5 #'.$sid.' đã qua nhưng KHÔNG đặt được cược — clear pending');
                     key_update($key, function($d) {
                         $d['pending_pred']=null; $d['pending_session']=null;
                         $d['pending_bet_amount']=null; $d['bet_session']=null; $d['bet_amount']=0;
@@ -562,7 +548,7 @@ function worker_step(string $key): array {
                     return $d;
                 });
                 $icon = $win ? '✅' : '❌';
-                $log = "$icon #$sid: $pred → $result (".implode('-',$dices).")".($jackpot?' 🎰':'');
+                $log = "$icon MD5 #$sid: $pred → $result (".implode('-',$dices).")".($jackpot?' 🎰':'');
                 key_log($key, $win?'success':'error', $log);
                 $actions[] = ['type'=>'result', 'msg'=>$log];
                 $s = key_load($key);
@@ -572,7 +558,6 @@ function worker_step(string $key): array {
         $s = key_load($key);
     }
 
-    // Clear stale pending
     if (!empty($s['pending_session']) && (int)$s['pending_session'] <= $latestId) {
         key_update($key, function($d) {
             $d['pending_pred']=null; $d['pending_session']=null;
@@ -582,7 +567,6 @@ function worker_step(string $key): array {
         $s = key_load($key);
     }
 
-    // Compute + bet
     $cfg = $s['config'];
     if (!empty($cfg['auto']) && empty($cfg['paused']) && empty($s['pending_pred'])) {
         $result = denius_compute($sessions, $latestId);
@@ -591,7 +575,7 @@ function worker_step(string $key): array {
 
         if ($result['skip']) {
             if ($shouldLog) {
-                key_log($key, 'info', '[V92] ⏭ BỎ TAY #'.($latestId+1)
+                key_log($key, 'info', '[V92] ⏭ BỎ TAY MD5 #'.($latestId+1)
                     .' | A='.$result['A'].' B='.$result['B'].' K='.$result['K'].' final='.$result['final']
                     .' | '.$result['reason']);
                 key_update($key, fn($d) => array_merge($d, ['last_compute_id'=>$latestId]));
@@ -600,7 +584,7 @@ function worker_step(string $key): array {
         }
         if ($result['prediction'] === null) {
             if ($shouldLog) {
-                key_log($key, 'warn', '[V92] ⚠️ Không predict được #'.($latestId+1).' | '.$result['reason']);
+                key_log($key, 'warn', '[V92] ⚠️ Không predict MD5 #'.($latestId+1).' | '.$result['reason']);
                 key_update($key, fn($d) => array_merge($d, ['last_compute_id'=>$latestId]));
             }
             return $actions;
@@ -615,7 +599,7 @@ function worker_step(string $key): array {
         if ($bal > 0 && $betAmt > $bal) $betAmt = $bal;
         if ($betAmt < 1000) {
             key_update($key, function($d) { $d['config']['auto']=false; $d['config']['paused']=true; return $d; });
-            key_log($key, 'error', '[V92] 🛑 Không đủ vốn (<1000đ) — dừng auto');
+            key_log($key, 'error', '[V92] 🛑 Không đủ vốn MD5 (<1000đ)');
             return $actions;
         }
 
@@ -628,7 +612,7 @@ function worker_step(string $key): array {
         });
 
         if ($shouldLog) {
-            $log = '[V92] 🎯 #'.($latestId+1).': '.$predStr.' '.number_format($betAmt).'đ (streak '.$betStreak.')'
+            $log = '[V92] 🎯 MD5 #'.($latestId+1).': '.$predStr.' '.number_format($betAmt).'đ (streak '.$betStreak.')'
                 .' | A='.$result['A'].' B='.$result['B'].' K='.$result['K'].' final='.$result['final']
                 .' | '.$result['reason'];
             if (!$result['bExact']) $log .= ' | ⚠️ B fallback #'.$result['bActual'];
@@ -638,7 +622,6 @@ function worker_step(string $key): array {
         $s = key_load($key);
     }
 
-    // WS bet
     $cfg = $s['config'];
     if (!empty($s['pending_pred']) && !empty($cfg['auto']) && empty($cfg['paused'])) {
         if ((int)($s['bet_session'] ?? 0) !== (int)($s['pending_session'] ?? 0)) {
@@ -691,7 +674,7 @@ function run_worker_daemon(string $key, int $max): void {
     $deadline = time() + $max; $lastBeat = 0;
     $buf = (int)($CFG['worker']['respawn_buffer'] ?? 60);
     worker_heartbeat($key, 'running');
-    key_log($key, 'info', '[V92] 🚀 Worker started PID='.getmypid());
+    key_log($key, 'info', '[V92] 🚀 Worker MD5 started PID='.getmypid());
     while (time() < $deadline) {
         $s = key_load($key);
         if (!$s) break;
@@ -711,7 +694,6 @@ function run_worker_daemon(string $key, int $max): void {
     worker_heartbeat($key, 'stopped');
 }
 function spawn_worker_async(string $key): void {
-    // Kill cũ trước (force)
     $lp = KEY_DIR . '/' . hash('sha256', strtolower($key)) . '.lock';
     if (is_file($lp)) {
         $pid = (int)trim(@file_get_contents($lp));
@@ -755,7 +737,7 @@ function spawn_worker_async(string $key): void {
             $spawned = true; $method = 'fgc';
         } catch (Throwable $e) {}
     }
-    key_log($key, $spawned ? 'info' : 'error', '[V92] Spawn: '.($spawned ? $method : 'FAILED all methods'));
+    key_log($key, $spawned ? 'info' : 'error', '[V92] Spawn MD5: '.($spawned ? $method : 'FAILED'));
 }
 
 // ═══════ ROUTER ═══════
@@ -798,7 +780,7 @@ try {
             if (!isset($s['bet_amount'])) $s['bet_amount']=0;
             if (!isset($s['pattern_10'])) $s['pattern_10']='';
             key_save($key, $s); key_save_by_user($u, $key);
-            key_log($key, 'info', '🔐 Login — '.$dev);
+            key_log($key, 'info', '🔐 Login MD5 — '.$dev);
             if (!worker_alive($key)) spawn_worker_async($key);
             echo json_encode(['ok'=>true,'user'=>$u,'nickname'=>$s['nickname'],'balance'=>$s['balance'],
                 'config'=>$s['config'],'history'=>$s['history'],
@@ -840,11 +822,8 @@ try {
             $s['config'] = $c;
             $s['pending_pred']=null; $s['pending_session']=null; $s['pending_bet_amount']=null;
             $s['bet_session']=null; $s['bet_amount']=0; $s['last_compute_id']=0;
-            $s['last_ws_error']=null;
-            // FORCE baseline reset để worker bắt đầu sạch
-            $s['last_session_id'] = 0;
+            $s['last_ws_error']=null; $s['last_session_id'] = 0;
             key_save($key, $s);
-            // FORCE kill + spawn new worker
             $lp = KEY_DIR.'/'.hash('sha256',strtolower($key)).'.lock';
             if (is_file($lp)) {
                 $pid = (int)trim(@file_get_contents($lp));
@@ -852,7 +831,7 @@ try {
                 @unlink($lp);
             }
             spawn_worker_async($key);
-            key_log($key, 'success', '[V92] ▶ SETUP: auto=true, vốn='.number_format($c['base_bet']).' target='.number_format($c['profit_stop']));
+            key_log($key, 'success', '[V92] ▶ SETUP MD5: auto=true, vốn='.number_format($c['base_bet']).' target='.number_format($c['profit_stop']));
             echo json_encode(['ok'=>true,'config'=>$c,'worker_alive'=>worker_alive($key)]);
             exit;
 
@@ -873,7 +852,7 @@ try {
                 if ($pid > 0 && function_exists('posix_kill')) @posix_kill($pid, SIGTERM);
                 @unlink($lp);
             }
-            key_log($key, 'warn', '[V92] 🛑 KILL');
+            key_log($key, 'warn', '[V92] 🛑 KILL MD5');
             echo json_encode(['ok'=>true]);
             exit;
 
@@ -881,7 +860,6 @@ try {
             $u = trim($_GET['user'] ?? ''); $tk = trim($_GET['auth_token'] ?? '');
             if (!verify_token($tk, $u)) { echo json_encode(['ok'=>false,'msg'=>'Unauthorized']); exit; }
             $key = key_resolve($u); $s = key_load($key);
-            // Auto-heal
             if (!empty($s['config']['auto']) && empty($s['config']['paused']) && !worker_alive($key)) {
                 @unlink(KEY_DIR.'/'.hash('sha256',strtolower($key)).'.lock');
                 spawn_worker_async($key);
@@ -931,7 +909,6 @@ try {
             echo json_encode(['ok'=>true]);
             exit;
 
-        // ═══ DEBUG ENDPOINTS ═══
         case 'debug':
             $u = trim($_GET['user'] ?? ''); $tk = trim($_GET['auth_token'] ?? '');
             if (!verify_token($tk, $u)) { echo json_encode(['ok'=>false,'msg'=>'Unauthorized']); exit; }
@@ -955,8 +932,9 @@ try {
                 if ($latestId > 0) $compute = denius_compute($sessions, $latestId);
             }
             echo json_encode([
-                'ok'=>true,
-                'user'=>$u,
+                'ok'=>true, 'table'=>'MD5',
+                'ws_host'=>$CFG['game']['ws_host'],
+                'sessions_api'=>$CFG['game']['sessions_api'],
                 'config'=>$s['config']??[],
                 'state'=>[
                     'balance'=>$s['balance']??0,
@@ -970,7 +948,7 @@ try {
                     'last_ws_error'=>$s['last_ws_error']??null,
                     'worker'=>['alive'=>worker_alive($key), 'info'=>$s['worker']??null],
                 ],
-                'sessions_api'=>$sessInfo,
+                'sessions_api_result'=>$sessInfo,
                 'compute_next'=>$compute,
                 'b_offset'=>$CFG['game']['b_offset'],
             ]);
@@ -981,11 +959,11 @@ try {
             if (!verify_token($tk, $u)) { echo json_encode(['ok'=>false,'msg'=>'Unauthorized']); exit; }
             $key = key_resolve($u); $s = key_load($key);
             if (empty($s['token'])) { echo json_encode(['ok'=>false,'msg'=>'Missing token']); exit; }
-            // Test connect only
             $wsPath = rtrim($CFG['game']['ws_path'],'/').'/?EIO=4&transport=websocket';
             $ws = new TinyWS($CFG['game']['ws_host'], 443, $wsPath, ['Authorization: Bearer '.$s['token']]);
             $connectOk = $ws->connect();
-            $result = ['connect'=>$connectOk, 'error'=>$connectOk ? null : $ws->error, 'stages'=>[]];
+            $result = ['table'=>'MD5', 'host'=>$CFG['game']['ws_host'], 'connect'=>$connectOk,
+                'error'=>$connectOk ? null : $ws->error, 'stages'=>[]];
             if ($connectOk) {
                 $auth = json_encode(['token'=>$s['token']], JSON_UNESCAPED_UNICODE);
                 $deadline = microtime(true) + 5;
@@ -994,16 +972,16 @@ try {
                     if ($frames === null) { $result['stages'][] = 'ws_closed'; break; }
                     if ($frames === []) continue;
                     foreach ($frames as $pkt) {
-                        if (str_starts_with($pkt, '0{')) { $ws->sendRaw('40/tx,'.$auth); $result['stages'][] = 'open→auth'; continue; }
+                        if (str_starts_with($pkt, '0{')) { $ws->sendRaw('40/txmd5,'.$auth); $result['stages'][] = 'open→auth(txmd5)'; continue; }
                         if ($pkt === '2') { $ws->sendRaw('3'); $result['stages'][] = 'ping→pong'; continue; }
                         if (!str_starts_with($pkt, '4')) continue;
                         $sio = substr($pkt, 1);
-                        if (str_starts_with($sio, '0/tx,')) { $result['stages'][] = 'joined_ns'; continue; }
+                        if (str_starts_with($sio, '0/txmd5,')) { $result['stages'][] = 'joined_ns_txmd5'; continue; }
                         if (str_starts_with($sio, '1')) { $result['stages'][] = 'sio_disconnect'; break 2; }
                         if (str_starts_with($sio, '4')) { $result['stages'][] = 'connect_error:'.substr($sio,0,60); break 2; }
                         if (str_starts_with($sio, '2')) {
                             $body = substr($sio, 1);
-                            if (str_starts_with($body, '/tx,')) $body = substr($body, strlen('/tx,'));
+                            if (str_starts_with($body, '/txmd5,')) $body = substr($body, strlen('/txmd5,'));
                             $msg = json_decode($body, true);
                             if (is_array($msg)) {
                                 $ev = $msg[0] ?? '';
@@ -1028,7 +1006,6 @@ try {
             $key = key_resolve($u);
             $s = key_load($key);
             if (empty($s['pending_pred'])) {
-                // Compute nếu chưa có
                 $data = fetch_sessions_api();
                 if (!$data || empty($data['list'])) { echo json_encode(['ok'=>false,'msg'=>'No sessions']); exit; }
                 $sessions = $data['list'];
@@ -1072,7 +1049,7 @@ function render_ui(): void { ?>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="theme-color" content="#05020f">
-<title>DENIUS v9.2</title>
+<title>DENIUS v9.2 · MD5</title>
 <style>
 :root{--bg:#05020f;--sakura:#ffb7d5;--gold:#ffd966;--mint:#7ef0b4;--ruby:#ff5c7a;--cyan:#6ee7ff;--text:#fff5eb;--dim:#a89cbd;--muted:#5e4d75;--bd:rgba(255,183,213,0.15)}
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
@@ -1089,6 +1066,7 @@ body{height:100dvh;overflow:hidden;position:fixed;inset:0;background:var(--bg);c
 .brand{font-size:24px;font-weight:900;letter-spacing:5px;text-align:center;background:linear-gradient(90deg,#ffd6e8,#ffe89a,#6ee7ff,#ffd6e8);background-size:300% 100%;-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:4px;animation:shim 4s linear infinite}
 @keyframes shim{to{background-position:300% 0}}
 .brand-sub{text-align:center;font-size:11px;letter-spacing:2px;color:var(--dim);font-weight:600;margin-bottom:22px}
+.brand-sub b{color:var(--cyan)}
 .field{margin-bottom:14px}
 .field label{display:block;font-size:10px;font-weight:800;color:var(--dim);text-transform:uppercase;letter-spacing:1.5px;margin-bottom:6px}
 .field input{width:100%;padding:14px 16px;background:rgba(5,2,15,0.8);border:1px solid var(--bd);border-radius:14px;color:var(--text);font-size:16px;outline:none;font-family:inherit;transition:all 0.25s}
@@ -1096,8 +1074,6 @@ body{height:100dvh;overflow:hidden;position:fixed;inset:0;background:var(--bg);c
 .btn{width:100%;padding:15px;border:none;border-radius:14px;font-size:13px;font-weight:900;letter-spacing:2px;text-transform:uppercase;cursor:pointer;transition:all 0.3s;font-family:inherit;margin-top:8px;position:relative;overflow:hidden;background:linear-gradient(135deg,#ffd6e8,#ffb7d5);color:#1a0d33;box-shadow:0 8px 28px -8px rgba(255,183,213,0.5)}
 .btn:hover:not(:disabled){transform:translateY(-2px);box-shadow:0 12px 36px -8px rgba(255,183,213,0.7)}
 .btn:disabled{opacity:0.5;cursor:not-allowed}
-.btn-ghost{background:rgba(255,183,213,0.1);color:var(--dim);box-shadow:none;border:1px solid var(--bd)}
-.btn-ghost:hover{background:rgba(255,183,213,0.2);color:var(--sakura)}
 .msg{margin-top:12px;padding:12px 16px;border-radius:12px;font-size:12px}
 .msg.err{background:rgba(255,92,122,0.1);border:1px solid rgba(255,92,122,0.3);color:#ffa0b3}
 .foot{margin-top:20px;text-align:center;font-size:10px;color:var(--muted);line-height:1.8}
@@ -1120,7 +1096,7 @@ body{height:100dvh;overflow:hidden;position:fixed;inset:0;background:var(--bg);c
 .hlogo{width:44px;height:44px;border-radius:50%;border:1.5px solid var(--sakura);background:#120828;flex-shrink:0;object-fit:cover}
 .hbrand{flex:1;min-width:0}
 .hbrand h1{font-size:13px;font-weight:900;letter-spacing:2px;background:linear-gradient(90deg,#ffd6e8,#ffe89a);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
-.hbrand small{display:block;font-size:9px;color:var(--dim);letter-spacing:1px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hbrand small{display:block;font-size:9px;color:var(--cyan);letter-spacing:1px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700}
 .hact{display:flex;gap:6px}
 .act{width:36px;height:36px;border-radius:50%;border:1px solid var(--bd);background:rgba(28,15,56,0.6);color:var(--dim);font-size:15px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-family:inherit;transition:all 0.2s}
 .act.kill{color:var(--ruby);border-color:rgba(255,92,122,0.35);background:rgba(255,92,122,0.1)}
@@ -1194,7 +1170,7 @@ body{height:100dvh;overflow:hidden;position:fixed;inset:0;background:var(--bg);c
 <div id="toast"></div>
 <script>
 const LOGO_URL = 'https://raw.githubusercontent.com/nguyenha783255-wq/LOGO-LC79/main/IMG_20260901_094944_094.jpg';
-const LS_KEY = 'denius_v92';
+const LS_KEY = 'denius_v92_md5';
 const app = document.getElementById('app');
 const toastBox = document.getElementById('toast');
 
@@ -1246,12 +1222,12 @@ function renderLogin() {
     '<div class="screen"><div class="wrap"><div class="card glass">' +
     '<img src="' + LOGO_URL + '" class="logo" onerror="this.style.display=\'none\'">' +
     '<div class="brand">DENIUS</div>' +
-    '<div class="brand-sub">お兄ちゃん · v9.2 BULLETPROOF</div>' +
+    '<div class="brand-sub">お兄ちゃん · <b>MD5</b> · v9.2</div>' +
     '<div class="field"><label>👤 TÀI KHOẢN</label><input id="in_u" type="text" placeholder="Nhập tài khoản..." value="' + esc(S.user) + '"></div>' +
     '<div class="field"><label>🔒 MẬT KHẨU</label><input id="in_p" type="password" placeholder="••••••••"></div>' +
     '<button class="btn" id="btn_login"' + (S.loading?' disabled':'') + '>' + (S.loading?'ĐANG XÁC THỰC':'ĐĂNG NHẬP') + '</button>' +
     (S.error ? '<div class="msg err">⚠️ ' + esc(S.error) + '</div>' : '') +
-    '<div class="foot"><b>V9.2 FIXED</b> · Admin <b>@DENIUS09</b></div>' +
+    '<div class="foot"><b>V9.2 · MD5</b> · Admin <b>@DENIUS09</b></div>' +
     '</div></div></div>';
   document.getElementById('btn_login').onclick = doLogin;
   document.getElementById('in_p').onkeydown = e => { if (e.key === 'Enter') doLogin(); };
@@ -1303,7 +1279,7 @@ function renderInfo() {
     '<div class="avatar">' + esc(init) + '</div>' +
     '<div class="greet">ようこそ、お兄ちゃん</div>' +
     '<div class="name">' + esc(S.nickname) + '</div>' +
-    '<div class="tag">ACCOUNT VERIFIED</div>' +
+    '<div class="tag">ACCOUNT VERIFIED · MD5</div>' +
     '<div class="stat"><span class="lbl">💰 SỐ DƯ</span><span class="val">' + fmt(S.balance) + 'đ</span></div>' +
     '<div class="stat"><span class="lbl">🔑 TÀI KHOẢN</span><span class="val">' + esc(S.user) + '</span></div>' +
     '<div class="stat"><span class="lbl">📱 DEVICE</span><span class="val" style="font-size:11px;color:var(--sakura)">' + esc(S.device) + '</span></div>' +
@@ -1321,7 +1297,7 @@ function renderBaseBet() {
     '<button class="back-btn" id="btn_back1">← Quay lại</button>' +
     '<div class="step">BƯỚC 1 / 2</div>' +
     '<div class="title">Vốn Cược Mỗi Tay</div>' +
-    '<div class="sub">Số dư: <b style="color:var(--gold)">' + fmt(bal) + 'đ</b></div>' +
+    '<div class="sub">Số dư: <b style="color:var(--gold)">' + fmt(bal) + 'đ</b> · Bàn <b style="color:var(--cyan)">MD5</b></div>' +
     '<div class="field"><label>💰 SỐ VỐN (VNĐ)</label><input id="in_base" type="number" inputmode="numeric" value="' + val + '" min="1000" step="1000"></div>' +
     '<button class="btn" id="btn_next1">TIẾP TỤC →</button>' +
     (S.error ? '<div class="msg err">⚠️ ' + esc(S.error) + '</div>' : '') +
@@ -1350,9 +1326,9 @@ function renderTarget() {
     '<div class="title">Mục Tiêu Lợi Nhuận</div>' +
     '<div class="sub">Khi đạt mục tiêu, bot tự dừng.</div>' +
     '<div class="field"><label>🎯 MỤC TIÊU (VNĐ)</label><input id="in_target" type="number" inputmode="numeric" value="' + val + '" min="10000" step="10000"></div>' +
-    '<button class="btn" id="btn_start"' + (S.loading?' disabled':'') + '>' + (S.loading?'ĐANG KHỞI ĐỘNG':'🚀 BẮT ĐẦU AUTO') + '</button>' +
+    '<button class="btn" id="btn_start"' + (S.loading?' disabled':'') + '>' + (S.loading?'ĐANG KHỞI ĐỘNG':'🚀 BẮT ĐẦU AUTO MD5') + '</button>' +
     (S.error ? '<div class="msg err">⚠️ ' + esc(S.error) + '</div>' : '') +
-    '<div class="hint">⚙️ <b>Công thức DENIUS:</b><br>A = dice1(prev) + lastDigit(id prev)<br>B = tổng dice phiên (prev − 22)<br>K = |A−B|, final = K−2 nếu B&gt;A<br>final=4 → BỎ TAY · final=5 → theo prev · final&lt;10 → bẻ<br>Bệt + pred bẻ → K parity (K chẵn TÀI / lẻ XỈU)<br>💰 Gấp thếp X2</div>' +
+    '<div class="hint">⚙️ <b>Công thức DENIUS (MD5):</b><br>A = dice1(prev) + lastDigit(id prev)<br>B = tổng dice phiên (prev − 22)<br>K = |A−B|, final = K−2 nếu B&gt;A<br>final=4 → BỎ TAY · final=5 → theo prev · final&lt;10 → bẻ<br>Bệt + pred bẻ → K parity (K chẵn TÀI / lẻ XỈU)<br>💰 Gấp thếp X2</div>' +
     '</div></div></div>';
   const inp = document.getElementById('in_target');
   inp.focus(); inp.select();
@@ -1376,7 +1352,7 @@ async function startAuto() {
     S.step = 'main'; S.tab = 'main';
     render();
     startTick();
-    toast('🚀 AUTO đã bật — worker force respawn', 'success');
+    toast('🚀 AUTO MD5 đã bật', 'success');
   } catch (e) { S.loading = false; S.error = 'Lỗi: ' + e.message; render(); }
 }
 
@@ -1413,7 +1389,7 @@ function renderMain() {
     '<div class="screen">' +
     '<div class="header glass">' +
     '<img src="' + LOGO_URL + '" class="hlogo" onerror="this.style.display=\'none\'">' +
-    '<div class="hbrand"><h1>DENIUS</h1><small>お兄ちゃん · ' + esc(S.nickname) + '</small></div>' +
+    '<div class="hbrand"><h1>DENIUS</h1><small>MD5 · ' + esc(S.nickname) + '</small></div>' +
     '<div class="hact">' +
     '<button class="act kill" id="btn_kill" title="Dừng">⏹</button>' +
     '<button class="act logout" id="btn_logout" title="Đăng xuất">⏏</button>' +
@@ -1423,7 +1399,7 @@ function renderMain() {
     '<span class="bal-val" id="bal_val">' + fmt(S.balance) + '</span><span class="bal-suf">đ</span></div>' +
     '<div class="res-card glass">' +
     '<div class="res-sess">PHIÊN #' + (S.pendingSession || '—') + '</div>' +
-    '<div class="res-lbl">' + (p ? 'DỰ ĐOÁN' : 'ĐANG CHỜ') + '</div>' +
+    '<div class="res-lbl">' + (p ? 'DỰ ĐOÁN MD5' : 'ĐANG CHỜ') + '</div>' +
     '<div class="res-val ' + predCls + '" id="pred_val">' + predTxt + '</div>' +
     '<div class="out ' + (lastH?'show':'') + '" id="outcome_box">' + (lastH ? renderOutcome(lastH) : '') + '</div>' +
     '</div>' +
@@ -1460,7 +1436,7 @@ function renderOutcome(h) {
 }
 
 async function doKill() {
-  if (!confirm('🛑 TẮT AUTO?')) return;
+  if (!confirm('🛑 TẮT AUTO MD5?')) return;
   try {
     await api('kill', {user:S.user});
     S.config.auto = false; S.config.paused = true;
@@ -1485,7 +1461,7 @@ function renderHistory() {
   const hist = S.history || [];
   let body;
   if (hist.length === 0) {
-    body = '<div class="empty"><span class="icon">🌸</span><div class="title">Chưa có lịch sử</div><div class="sub">Bật AUTO để ghi nhận</div></div>';
+    body = '<div class="empty"><span class="icon">🌸</span><div class="title">Chưa có lịch sử MD5</div><div class="sub">Bật AUTO để ghi nhận</div></div>';
   } else {
     body = hist.slice(0,100).map(h => {
       let cls = 'lose', delta = '-' + fmt(h.amount);
@@ -1504,7 +1480,7 @@ function renderHistory() {
   }
   app.innerHTML =
     '<div class="screen">' +
-    '<div class="h-head glass"><div class="h-title">📜 LỊCH SỬ</div><div class="h-count">' + hist.length + ' phiên</div></div>' +
+    '<div class="h-head glass"><div class="h-title">📜 LỊCH SỬ MD5</div><div class="h-count">' + hist.length + ' phiên</div></div>' +
     '<div class="h-scroll" id="hist_list">' + body + '</div>' +
     '<div class="nav"><button class="nav-btn" id="nav_main2">🎯 Chính</button><button class="nav-btn on" id="nav_hist2">📜 Lịch sử</button></div>' +
     '</div>';
@@ -1571,7 +1547,7 @@ async function tick() {
       const ps = document.querySelector('.res-sess');
       if (ps) ps.textContent = 'PHIÊN #' + (S.pendingSession || '—');
       const pl = document.querySelector('.res-lbl');
-      if (pl) pl.textContent = S.pendingPred ? 'DỰ ĐOÁN' : 'ĐANG CHỜ';
+      if (pl) pl.textContent = S.pendingPred ? 'DỰ ĐOÁN MD5' : 'ĐANG CHỜ';
       const bv2 = document.getElementById('bet_val');
       if (bv2) {
         let t = '—';
