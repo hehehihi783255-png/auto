@@ -1841,19 +1841,7 @@ function renderTarget() {
     '<div class="field"><label>🎯 MỤC TIÊU (VNĐ)</label><input id="in_target" type="number" inputmode="numeric" value="' + val + '" min="10000" step="10000"></div>' +
     '<button class="btn" id="btn_start"' + (S.loading?' disabled':'') + '>' + (S.loading?'ĐANG KHỞI ĐỘNG':'🌸 BẮT ĐẦU AUTO MD5') + '</button>' +
     (S.error ? '<div class="msg err">⚠️ ' + esc(S.error) + '</div>' : '') +
-    '<div class="hint"><b>Công thức DENIUS v10:</b><br>' +
-    '• <code>A</code> = dice1(prev) + lastDigit(id prev)<br>' +
-    '• <code>B</code> = <b>dice1</b> của phiên (prev − 22)<br>' +
-    '• <code>B&gt;A</code> → K = B−A, R = K−2<br>' +
-    '• <code>A&gt;B</code> → K = A−B, R = K<br>' +
-    '• <code>A=B</code> → R = 0<br>' +
-    '• <code>R=4</code> → BỎ · <code>R=5</code> → theo prev<br>' +
-    '• <code>R&lt;10</code> → bẻ · <code>R≥10</code> → chẵn XỈU/lẻ TÀI<br>' +
-    '• <code>R âm</code> → abs parity<br>' +
-    '• Bệt + pred ngược → K parity (chẵn TÀI/lẻ XỈU)<br>' +
-    '• 3 tay thua → STUCK theo pred tay 3<br>' +
-    '• Gấp thếp: <code>base × 2^streak</code></div>' +
-    '</div></div></div>';
+    '<div class="hint"><b>Công thức DENIUS v10</b></div>
   const inp = document.getElementById('in_target');
   inp.focus(); inp.select();
   document.getElementById('btn_back2').onclick = () => { S.step = 'base_bet'; render(); };
