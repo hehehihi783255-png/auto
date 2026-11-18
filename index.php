@@ -1,13 +1,17 @@
 <?php
 /**
- * DENIUS AUTO v9.3-MD5 — STUCK PREDICTION + GẤP THẾP CHUẨN
+ * DENIUS AUTO v10.0-MD5 — CÔNG THỨC CHUẨN + SAKURA DREAM UI
  * 
- * FIX:
- *  1. stuck_pred: Thua ≥3 tay → lưu prediction tay thua thứ 3, các tay sau theo đúng prediction đó
- *     → thắng mới clear stuck + quay lại tính công thức
- *  2. Gấp thếp: bet = base × 2^bet_streak, KHÔNG cap (chỉ cap kỹ thuật 62 + balance)
- *  3. Balance: KHÔNG update từ postBalance (chỉ log), chỉ tự tính settle
- *     (tránh conflict khiến balance sai)
+ * CÔNG THỨC:
+ *  A = dice1(prev) + lastDigit(id prev)
+ *  B = dice1(phiên (prev - 22))  ← chỉ lấy dice thứ 1, KHÔNG tổng 3 dice
+ *  B > A → K = B-A, R = K-2
+ *  A > B → K = A-B, R = K
+ *  A = B → R = 0
+ *  R=4 → BỎ TAY | R=5 → theo prev | R<10 (khác 4,5) → bẻ | R≥10 → chẵn XỈU/lẻ TÀI | R âm → abs parity
+ *  Bệt + pred ngược bệt → dùng K parity (K chẵn TÀI, lẻ XỈU)
+ * 
+ * FEATURES: stuck 3 tay + gấp thếp base×2^streak + balance tự tính + MD5
  */
 
 $CFG = [
@@ -20,7 +24,7 @@ $CFG = [
         'b_offset'     => 22,
     ],
     'security' => [
-        'hmac_secret' => 'DENIUS_v93_STUCK_HMAC',
+        'hmac_secret' => 'DENIUS_v10_FORMULA_HMAC',
         'session_ttl' => 2592000,
     ],
     'worker' => [
@@ -36,7 +40,7 @@ $CFG = [
         'paused'      => false,
         'lose_streak' => 0,
         'bet_streak'  => 0,
-        'stuck_pred'  => null,   // 'Tài'|'Xỉu'|null
+        'stuck_pred'  => null,
         'onboarded'   => false,
     ],
     'max_history' => 500,
@@ -167,7 +171,9 @@ function denius_detect_jackpot(array $found, array $dices): bool {
     return false;
 }
 
-// ═══════ FORMULA DENIUS ═══════
+// ═══════════════════════════════════════════════════════════════
+// 🧮 CÔNG THỨC DENIUS v10 — B = dice1 phiên 22
+// ═══════════════════════════════════════════════════════════════
 function denius_map_result(string $raw): ?string {
     $map = ['Tài'=>'TAI','Xỉu'=>'XIU','tai'=>'TAI','xiu'=>'XIU','TAI'=>'TAI','XIU'=>'XIU','TÀI'=>'TAI','XỈU'=>'XIU'];
     return $map[$raw] ?? null;
@@ -187,72 +193,135 @@ function denius_find_session(array $sessions, int $targetId): ?array {
     foreach ($sessions as $row) if ((int)$row['id'] === $targetId) return $row;
     return null;
 }
+
+/**
+ * Tính công thức DENIUS v10 cho phiên (latestId + 1)
+ * 
+ * Trả về array đầy đủ theo mục VIII:
+ *  current, prev, s22, prevDice1, prevLastDigit, prevResult,
+ *  A, B, K, R, formula, streak, streakSide,
+ *  skip, pred, predBeforeBệt, bệtTriggered, bệtResult,
+ *  final, reason, ok
+ */
 function denius_compute(array $sessions, int $latestId): array {
     global $CFG;
     $bOffset = (int)($CFG['game']['b_offset'] ?? 22);
     $out = [
         'ok'=>false, 'skip'=>true, 'prediction'=>null,
-        'A'=>0, 'B'=>0, 'K'=>0, 'final'=>0,
-        'streak'=>0, 'streakSide'=>null, 'prevResult'=>null,
-        'bExact'=>false, 'bWanted'=>$latestId - $bOffset, 'bActual'=>0,
+        'current'=>$latestId + 1,
+        'prev'=>$latestId,
+        's22'=>$latestId - $bOffset,
+        'prevDice1'=>0, 'prevLastDigit'=>0, 'prevResult'=>null,
+        'A'=>0, 'B'=>0, 'K'=>0, 'R'=>0, 'formula'=>'',
+        'streak'=>0, 'streakSide'=>null,
+        'bExact'=>false, 'bActual'=>0,
+        'predBeforeBệt'=>null, 'bệtTriggered'=>false, 'bệtResult'=>null,
         'reason'=>'Không đủ dữ liệu',
     ];
+
+    // 1. Phiên trước
     $prev = denius_find_session($sessions, $latestId);
-    if (!$prev) { $out['reason'] = 'Không tìm phiên #'.$latestId; return $out; }
+    if (!$prev) { $out['reason'] = 'Không tìm phiên trước #'.$latestId; return $out; }
     $prevSide = denius_map_result((string)($prev['resultTruyenThong'] ?? ''));
-    if ($prevSide === null) { $out['reason'] = 'Phiên #'.$latestId.' chưa có KQ'; return $out; }
+    if ($prevSide === null) { $out['reason'] = 'Phiên #'.$latestId.' chưa có kết quả'; return $out; }
+    $out['prevResult'] = $prevSide;
 
-    $dices = $prev['dices'] ?? [0,0,0];
-    $dice1 = (int)($dices[0] ?? 0);
-    $A = $dice1 + ($latestId % 10);
+    // 2. X = dice1(prev), Y = lastDigit(id prev)
+    $prevDices = $prev['dices'] ?? [0,0,0];
+    $dice1 = (int)($prevDices[0] ?? 0);
+    $lastDigit = $latestId % 10;
+    $out['prevDice1'] = $dice1;
+    $out['prevLastDigit'] = $lastDigit;
 
+    // 3. A = dice1 + lastDigit
+    $A = $dice1 + $lastDigit;
+    $out['A'] = $A;
+
+    // 4. B = dice1 của phiên (latestId - 22)
     $bRow = denius_find_session($sessions, $latestId - $bOffset);
     if ($bRow) {
         $out['bExact'] = true;
         $out['bActual'] = $latestId - $bOffset;
     } else {
+        // Fallback: phiên xa nhất có trong list
         $minId = PHP_INT_MAX; $furthest = null;
         foreach ($sessions as $row) {
             $id = (int)$row['id'];
             if ($id < $latestId && $id < $minId) { $minId = $id; $furthest = $row; }
         }
-        if (!$furthest) { $out['A'] = $A; $out['prevResult'] = $prevSide;
-            $out['reason'] = 'Không có phiên B'; return $out; }
+        if (!$furthest) { $out['reason'] = 'Không tìm phiên thứ 22 (#'.$out['s22'].')'; return $out; }
         $bRow = $furthest;
         $out['bActual'] = $minId;
     }
-    $bD = $bRow['dices'] ?? [0,0,0];
-    $B = 0; foreach ($bD as $v) $B += (int)$v;
 
-    $K = 0; $final = 0;
-    if ($B > $A) { $K = $B - $A; $final = $K - 2; }
-    elseif ($A > $B) { $K = $A - $B; $final = $K; }
+    $bDices = $bRow['dices'] ?? [0,0,0];
+    $B = (int)($bDices[0] ?? 0);   // ⚠️ CHỈ LẤY DICE THỨ NHẤT của phiên 22
+    $out['B'] = $B;
 
-    $streakInfo = denius_count_streak($sessions);
+    // 5. K và R
+    $K = 0; $R = 0; $formula = '';
+    if ($B > $A) {
+        $K = $B - $A;
+        $R = $K - 2;
+        $formula = "B($B) > A($A) → K = B-A = $K → R = K-2 = $R";
+    } elseif ($A > $B) {
+        $K = $A - $B;
+        $R = $K;
+        $formula = "A($A) > B($B) → K = A-B = $K → R = K = $R";
+    } else {
+        $K = 0; $R = 0;
+        $formula = "A($A) = B($B) → K = 0 → R = 0";
+    }
+    $out['K'] = $K;
+    $out['R'] = $R;
+    $out['formula'] = $formula;
 
+    // 6. Xác định prediction thông thường (trước bẻ bệt)
     $pred = null; $skip = false; $reason = '';
-    if ($final === 4) { $skip = true; $reason = 'BỎ TAY (final=4)'; }
-    elseif ($final === 5) { $pred = $prevSide; $reason = 'Theo prev (final=5)'; }
-    elseif ($final < 0) { $pred = (abs($final) % 2 === 0) ? 'XIU' : 'TAI'; $reason = 'final âm ('.$final.')'; }
-    elseif ($final >= 10) { $pred = ($final % 2 === 0) ? 'XIU' : 'TAI'; $reason = 'final≥10 ('.$final.')'; }
-    else { $pred = ($prevSide === 'TAI') ? 'XIU' : 'TAI'; $reason = 'Bẻ prev (final='.$final.')'; }
 
-    if (!$skip && $streakInfo['len'] >= 2 && $streakInfo['side'] !== null && $pred !== null) {
+    if ($R === 4) {
+        $skip = true;
+        $reason = 'R=4 → BỎ TAY';
+    } elseif ($R === 5) {
+        $pred = $prevSide;
+        $reason = 'R=5 → theo phiên trước ('.$prevSide.')';
+    } elseif ($R >= 0 && $R < 10) {
+        // 0,1,2,3,6,7,8,9 (4,5 đã loại)
+        $pred = ($prevSide === 'TAI') ? 'XIU' : 'TAI';
+        $reason = 'R='.$R.' (nhỏ hơn 10, khác 4,5) → bẻ phiên trước ('.$prevSide.' → '.$pred.')';
+    } elseif ($R >= 10) {
+        $pred = ($R % 2 === 0) ? 'XIU' : 'TAI';
+        $reason = 'R='.$R.' ≥10 → '.($R % 2 === 0 ? 'chẵn' : 'lẻ').' → '.$pred;
+    } else {
+        // R < 0
+        $abs = abs($R);
+        $pred = ($abs % 2 === 0) ? 'XIU' : 'TAI';
+        $reason = 'R='.$R.' (âm) → |R|='.$abs.' '.($abs % 2 === 0 ? 'chẵn' : 'lẻ').' → '.$pred;
+    }
+
+    $out['predBeforeBệt'] = $pred;
+
+    // 7. Bẻ bệt: chỉ khi streak >= 2 và pred != streakSide
+    $streakInfo = denius_count_streak($sessions);
+    $out['streak'] = $streakInfo['len'];
+    $out['streakSide'] = $streakInfo['side'];
+
+    if (!$skip && $pred !== null && $streakInfo['len'] >= 2 && $streakInfo['side'] !== null) {
         if ($pred !== $streakInfo['side']) {
-            $pred = ($K % 2 === 0) ? 'TAI' : 'XIU';
-            $reason .= ' | BẺ BỆT: K='.$K.' → '.$pred;
+            // Kích hoạt bẻ bệt → dùng K parity
+            $out['bệtTriggered'] = true;
+            $newPred = ($K % 2 === 0) ? 'TAI' : 'XIU';
+            $out['bệtResult'] = $newPred;
+            $reason .= ' | BẺ BỆT (đang bệt '.$streakInfo['side'].' ×'.$streakInfo['len'].'): K='.$K.' '.($K % 2 === 0 ? 'chẵn' : 'lẻ').' → '.$newPred;
+            $pred = $newPred;
         } else {
-            $reason .= ' | Đang bệt '.$streakInfo['side'].' → giữ';
+            $reason .= ' | Đang bệt '.$streakInfo['side'].' ×'.$streakInfo['len'].' → giữ nguyên theo bệt';
         }
     }
 
-    $out['ok'] = ($pred !== null);
+    $out['ok'] = ($pred !== null || $skip);
     $out['skip'] = $skip;
     $out['prediction'] = $pred;
-    $out['A'] = $A; $out['B'] = $B; $out['K'] = $K; $out['final'] = $final;
-    $out['streak'] = $streakInfo['len'];
-    $out['streakSide'] = $streakInfo['side'];
-    $out['prevResult'] = $prevSide;
     $out['reason'] = $reason;
     return $out;
 }
@@ -348,10 +417,10 @@ function do_ws_bet(string $key, array $s, array &$actions): array {
     $wsPath = rtrim($CFG['game']['ws_path'], '/') . '/?EIO=4&transport=websocket';
     $ws = new TinyWS($CFG['game']['ws_host'], 443, $wsPath, ['Authorization: Bearer ' . $s['token']]);
     if (!$ws->connect()) {
-        key_log($key, 'error', '[V93-WS] ❌ Connect fail: ' . $ws->error);
+        key_log($key, 'error', '[V10-WS] ❌ Connect fail: ' . $ws->error);
         return ['ok'=>false, 'reason'=>'Connect: '.$ws->error];
     }
-    key_log($key, 'info', '[V93-WS] ✅ Connected MD5');
+    key_log($key, 'info', '[V10-WS] ✅ Connected MD5');
 
     $auth = json_encode(['token'=>$s['token']], JSON_UNESCAPED_UNICODE);
     $stage = 'wait_open';
@@ -378,7 +447,6 @@ function do_ws_bet(string $key, array $s, array &$actions): array {
             if ($pkt === '1') { $ws->close(); return ['ok'=>false, 'reason'=>'Engine.IO close']; }
             if (!str_starts_with($pkt, '4')) continue;
             $sio = substr($pkt, 1);
-
             if (str_starts_with($sio, '0/txmd5,')) { $stage = 'joined'; $joined = true; continue; }
             if (str_starts_with($sio, '1')) { $ws->close(); return ['ok'=>false, 'reason'=>'SIO disconnect']; }
             if (str_starts_with($sio, '4')) { $ws->close(); return ['ok'=>false, 'reason'=>'CONNECT_ERROR: '.substr($sio,0,80)]; }
@@ -400,14 +468,13 @@ function do_ws_bet(string $key, array $s, array &$actions): array {
                     $stage = 'bet_sent';
                     $ws->sendRaw('42/txmd5,' . json_encode(['bet', ['type'=>$side, 'amount'=>$amount]], JSON_UNESCAPED_UNICODE));
                     $done = true;
-                    key_log($key, 'success', '[V93-WS] 💰 Bet SENT MD5: #'.$ps.' '.$side.' '.number_format($amount));
+                    key_log($key, 'success', '[V10-WS] 💰 Bet SENT MD5: #'.$ps.' '.$side.' '.number_format($amount));
                     $actions[] = ['type'=>'bet', 'msg'=>"Bet MD5 #$ps $side $amount"];
                     key_update($key, function($dd) use ($ps, $amount) {
                         $dd['bet_session'] = $ps;
                         $dd['bet_amount'] = $amount;
                         return $dd;
                     });
-                    // Chờ ack — chỉ LOG postBalance, KHÔNG update balance
                     $wait = microtime(true) + 2;
                     while (microtime(true) < $wait) {
                         $more = $ws->readOneFrame(1);
@@ -422,14 +489,12 @@ function do_ws_bet(string $key, array $s, array &$actions): array {
                             $m2 = json_decode($b2, true);
                             if (!is_array($m2)) continue;
                             if (($m2[0] ?? '') === 'bet-result') {
-                                key_log($key, 'success', '[V93-WS] ✅ Bet ACK');
+                                key_log($key, 'success', '[V10-WS] ✅ Bet ACK');
                                 if (isset($m2[1]['postBalance'])) {
-                                    // CHỈ log, KHÔNG update balance (tránh conflict)
                                     key_update($key, function($dd) use ($m2) {
                                         $dd['last_post_balance'] = $m2[1]['postBalance'];
                                         return $dd;
                                     });
-                                    key_log($key, 'info', '[V93-WS] 📊 postBalance server = '.number_format($m2[1]['postBalance']));
                                 }
                             }
                         }
@@ -444,11 +509,11 @@ function do_ws_bet(string $key, array $s, array &$actions): array {
     $ws->close();
     $reason = 'Timeout 8s — stage='.$stage;
     if ($joined && !$sawBetting) $reason .= ' (không bắt được BETTING)';
-    key_log($key, 'error', '[V93-WS] ❌ ' . $reason);
+    key_log($key, 'error', '[V10-WS] ❌ ' . $reason);
     return ['ok'=>false, 'reason'=>$reason];
 }
 
-// ═══════ WORKER v9.3 ═══════
+// ═══════ WORKER v10 ═══════
 function worker_step(string $key): array {
     $actions = [];
     $s = key_load($key);
@@ -467,7 +532,7 @@ function worker_step(string $key): array {
     $data = fetch_sessions_api();
     if (!$data || empty($data['list'])) {
         if (($s['last_api_fail_log'] ?? 0) < time() - 60) {
-            key_log($key, 'warn', '[V93] ⚠️ sessions API fail MD5');
+            key_log($key, 'warn', '[V10] ⚠️ sessions API fail MD5');
             key_update($key, fn($d) => array_merge($d, ['last_api_fail_log' => time()]));
         }
         return $actions;
@@ -480,14 +545,14 @@ function worker_step(string $key): array {
             $latestId = (int)$row['id']; break;
         }
     }
-    if ($latestId === 0) { key_log($key, 'warn', '[V93] Không có phiên có KQ MD5'); return $actions; }
+    if ($latestId === 0) { key_log($key, 'warn', '[V10] Không có phiên có KQ MD5'); return $actions; }
 
     $lastId = (int)($s['last_session_id'] ?? 0);
 
     // Baseline
     if ($lastId === 0) {
         key_update($key, fn($d) => array_merge($d, ['last_session_id'=>$latestId]));
-        key_log($key, 'info', '[V93] 📡 Baseline MD5 #'.$latestId);
+        key_log($key, 'info', '[V10] 📡 Baseline MD5 #'.$latestId);
         return $actions;
     }
 
@@ -507,7 +572,7 @@ function worker_step(string $key): array {
                 $betPlaced = ((int)($s['bet_session'] ?? 0) === $sid);
 
                 if (!$betPlaced) {
-                    key_log($key, 'error', '[V93] ⚠️ Phiên MD5 #'.$sid.' KHÔNG đặt được cược — clear pending');
+                    key_log($key, 'error', '[V10] ⚠️ Phiên MD5 #'.$sid.' KHÔNG đặt được cược — clear pending');
                     key_update($key, function($d) {
                         $d['pending_pred']=null; $d['pending_session']=null;
                         $d['pending_bet_amount']=null; $d['bet_session']=null; $d['bet_amount']=0;
@@ -519,28 +584,20 @@ function worker_step(string $key): array {
 
                 $win = (($pred==='Tài'||$pred==='T') && $result==='TAI') || (($pred==='Xỉu'||$pred==='X') && $result==='XIU');
 
-                // ═══ SETTLE: STUCK LOGIC + BALANCE TỰ TÍNH ═══
                 key_update($key, function($d) use ($sid, $pred, $result, $dices, $win, $jackpot, $tong) {
                     $c = $d['config'];
                     $st = (int)($c['lose_streak'] ?? 0);
                     $bSt = (int)($c['bet_streak'] ?? 0);
-                    $wasStuck = $c['stuck_pred'] ?? null;
 
                     if ($win) {
-                        // THẮNG → reset hết, clear stuck
                         $st = 0;
                         $bSt = 0;
                         $c['stuck_pred'] = null;
                         $d['win_count_total'] = (int)($d['win_count_total'] ?? 0) + 1;
-                        if ($wasStuck !== null) {
-                            // Log riêng: thắng sau khi thoát stuck
-                        }
                     } else {
-                        // THUA
                         $d['loss_count_total'] = (int)($d['loss_count_total'] ?? 0) + 1;
                         $st++;
                         $bSt++;
-                        // Nếu bet_streak >= 3 và chưa stuck → set stuck = prediction vừa thua (tay thứ 3)
                         if ($bSt >= 3 && empty($c['stuck_pred'])) {
                             $c['stuck_pred'] = $pred;
                         }
@@ -557,7 +614,6 @@ function worker_step(string $key): array {
                     $d['balance'] = $bal;
                     $d['profit_total'] = (int)($d['profit_total'] ?? 0) + $delta;
 
-                    // History
                     $d['history'] = $d['history'] ?? [];
                     array_unshift($d['history'], [
                         'ts'=>date('H:i:s d/m'),'session'=>$sid,'pred'=>$pred,'result'=>$result,
@@ -568,11 +624,9 @@ function worker_step(string $key): array {
                     ]);
                     $d['history'] = array_slice($d['history'], 0, 500);
 
-                    // Clear pending
                     $d['pending_pred']=null; $d['pending_session']=null;
                     $d['pending_bet_amount']=null; $d['bet_session']=null; $d['bet_amount']=0;
 
-                    // Pattern 10
                     $sym = ($result==='TAI')?'T':'X';
                     $p10 = ($d['pattern_10'] ?? '') . $sym;
                     if (strlen($p10)>10) $p10 = substr($p10,-10);
@@ -616,27 +670,23 @@ function worker_step(string $key): array {
         $computeInfo = null;
 
         if (!empty($stuckPred) && ($stuckPred === 'Tài' || $stuckPred === 'Xỉu')) {
-            // ═══ STUCK MODE: theo prediction của phiên thua tay 3 ═══
             $predStr = $stuckPred;
-            $reason = 'STUCK → theo dự đoán phiên vừa rồi: ' . $stuckPred;
+            $reason = 'STUCK → theo dự đoán tay thua thứ 3: '.$stuckPred;
             $isStuckMode = true;
         } else {
-            // ═══ NORMAL MODE: tính công thức ═══
             $result = denius_compute($sessions, $latestId);
             $computeInfo = $result;
 
             if ($result['skip']) {
                 if ($shouldLog) {
-                    key_log($key, 'info', '[V93] ⏭ BỎ TAY MD5 #'.($latestId+1)
-                        .' | A='.$result['A'].' B='.$result['B'].' K='.$result['K'].' final='.$result['final']
-                        .' | '.$result['reason']);
+                    key_log($key, 'info', '[V10] ⏭ BỎ TAY MD5 #'.($latestId+1).' — '.$result['reason']);
                     key_update($key, fn($d) => array_merge($d, ['last_compute_id'=>$latestId]));
                 }
                 return $actions;
             }
             if ($result['prediction'] === null) {
                 if ($shouldLog) {
-                    key_log($key, 'warn', '[V93] ⚠️ Không predict MD5 #'.($latestId+1).' | '.$result['reason']);
+                    key_log($key, 'warn', '[V10] ⚠️ Không predict MD5 #'.($latestId+1).' — '.$result['reason']);
                     key_update($key, fn($d) => array_merge($d, ['last_compute_id'=>$latestId]));
                 }
                 return $actions;
@@ -645,7 +695,7 @@ function worker_step(string $key): array {
             $reason = $result['reason'];
         }
 
-        // ═══ GẤP THẾP CHUẨN: base × 2^bet_streak ═══
+        // GẤP THẾP CHUẨN
         $betStreak = (int)($cfg['bet_streak'] ?? 0);
         $baseBet = max(1000, (int)($cfg['base_bet'] ?? 10000));
         $bal = (int)($s['balance'] ?? 0);
@@ -656,7 +706,7 @@ function worker_step(string $key): array {
 
         if ($bal < 1000) {
             key_update($key, function($d) { $d['config']['auto']=false; $d['config']['paused']=true; return $d; });
-            key_log($key, 'error', '[V93] 🛑 Balance < 1000đ — dừng auto');
+            key_log($key, 'error', '[V10] 🛑 Balance < 1000đ — dừng auto');
             return $actions;
         }
 
@@ -669,19 +719,23 @@ function worker_step(string $key): array {
         });
 
         if ($shouldLog) {
-            $tag = $isStuckMode ? '🔄 STUCK' : '🎯';
-            $log = '[V93] '.$tag.' MD5 #'.($latestId+1).': '.$predStr.' '.number_format($betAmt).'đ'
-                .' (bet_streak='.$betStreak.' × '.$mult.')';
             if ($isStuckMode) {
-                $log .= ' | ' . $reason;
+                $log = '[V10] 🔄 STUCK MD5 #'.($latestId+1).': '.$predStr.' '.number_format($betAmt).'đ (streak='.$betStreak.') | '.$reason;
+                key_log($key, 'info', $log);
+                $actions[] = ['type'=>'predict', 'msg'=>$log];
             } else {
-                $log .= ' | A='.$computeInfo['A'].' B='.$computeInfo['B']
-                      . ' K='.$computeInfo['K'].' final='.$computeInfo['final']
-                      . ' | '.$computeInfo['reason'];
-                if (!$computeInfo['bExact']) $log .= ' | ⚠️ B fallback #'.$computeInfo['bActual'];
+                // Report chi tiết theo mục VIII
+                $report = '[V10] 🎯 MD5 #'.($latestId+1).' | A='.$computeInfo['A'].' B='.$computeInfo['B'].' K='.$computeInfo['K'].' R='.$computeInfo['R'];
+                $report .= ' | CT: '.$computeInfo['formula'];
+                $report .= ' | Bệt: '.($computeInfo['streak'] >= 2 ? ('ĐANG bệt '.$computeInfo['streakSide'].' ×'.$computeInfo['streak']) : 'KHÔNG');
+                if ($computeInfo['bệtTriggered']) {
+                    $report .= ' | BẺ BỆT: dùng K='.$computeInfo['K'].' → '.$computeInfo['bệtResult'];
+                }
+                $report .= ' | Dự đoán: '.$predStr.' | Bet: '.number_format($betAmt).'đ ×'.$mult;
+                if (!$computeInfo['bExact']) $report .= ' | ⚠️ B fallback #'.$computeInfo['bActual'].' (cần #'.$computeInfo['s22'].')';
+                key_log($key, 'info', $report);
+                $actions[] = ['type'=>'predict', 'msg'=>$report];
             }
-            key_log($key, 'info', $log);
-            $actions[] = ['type'=>'predict', 'msg'=>$log];
         }
         $s = key_load($key);
     }
@@ -734,17 +788,17 @@ function run_worker_daemon(string $key, int $max): void {
     if (function_exists('fastcgi_finish_request')) @fastcgi_finish_request();
     else { @ob_end_clean(); header('Connection: close'); header('Content-Length: 0'); @flush(); @ob_end_flush(); }
     @ignore_user_abort(true); @set_time_limit(0); @ini_set('memory_limit', '256M');
-    if (!worker_lock($key)) { error_log("[V93] Lock exists for $key"); return; }
+    if (!worker_lock($key)) return;
     $sleep = (int)($CFG['worker']['loop_sleep'] ?? 1);
     $deadline = time() + $max; $lastBeat = 0;
     $buf = (int)($CFG['worker']['respawn_buffer'] ?? 60);
     worker_heartbeat($key, 'running');
-    key_log($key, 'info', '[V93] 🚀 Worker MD5 started PID='.getmypid());
+    key_log($key, 'info', '[V10] 🚀 Worker MD5 started PID='.getmypid());
     while (time() < $deadline) {
         $s = key_load($key);
         if (!$s) break;
         try { worker_step($key); }
-        catch (Throwable $e) { key_log($key, 'error', '[V93] 💥 '.$e->getMessage()); }
+        catch (Throwable $e) { key_log($key, 'error', '[V10] 💥 '.$e->getMessage()); }
         if (time() - $lastBeat >= 10) { worker_heartbeat($key, 'running'); $lastBeat = time(); }
         if ((time() + $buf) >= $deadline) {
             $s2 = key_load($key);
@@ -802,7 +856,7 @@ function spawn_worker_async(string $key): void {
             $spawned = true; $method = 'fgc';
         } catch (Throwable $e) {}
     }
-    key_log($key, $spawned ? 'info' : 'error', '[V93] Spawn MD5: '.($spawned ? $method : 'FAILED'));
+    key_log($key, $spawned ? 'info' : 'error', '[V10] Spawn MD5: '.($spawned ? $method : 'FAILED'));
 }
 
 // ═══════ ROUTER ═══════
@@ -846,7 +900,7 @@ try {
             if (!isset($s['pattern_10'])) $s['pattern_10']='';
             if (!array_key_exists('stuck_pred', $s['config'])) $s['config']['stuck_pred']=null;
             key_save($key, $s); key_save_by_user($u, $key);
-            key_log($key, 'info', '🔐 Login MD5 v9.3 — '.$dev);
+            key_log($key, 'info', '🔐 Login MD5 v10 — '.$dev);
             if (!worker_alive($key)) spawn_worker_async($key);
             echo json_encode(['ok'=>true,'user'=>$u,'nickname'=>$s['nickname'],'balance'=>$s['balance'],
                 'config'=>$s['config'],'history'=>$s['history'],
@@ -897,7 +951,7 @@ try {
                 @unlink($lp);
             }
             spawn_worker_async($key);
-            key_log($key, 'success', '[V93] ▶ SETUP MD5: auto=true, base='.number_format($c['base_bet']).' target='.number_format($c['profit_stop']));
+            key_log($key, 'success', '[V10] ▶ SETUP MD5: auto=true, base='.number_format($c['base_bet']).' target='.number_format($c['profit_stop']));
             echo json_encode(['ok'=>true,'config'=>$c,'worker_alive'=>worker_alive($key)]);
             exit;
 
@@ -918,17 +972,16 @@ try {
                 if ($pid > 0 && function_exists('posix_kill')) @posix_kill($pid, SIGTERM);
                 @unlink($lp);
             }
-            key_log($key, 'warn', '[V93] 🛑 KILL MD5');
+            key_log($key, 'warn', '[V10] 🛑 KILL MD5');
             echo json_encode(['ok'=>true]);
             exit;
 
         case 'reset_stuck':
-            // Reset stuck thủ công (giữ nguyên bet_streak, chỉ clear stuck)
             $u = trim($_POST['user'] ?? ''); $tk = trim($_POST['auth_token'] ?? '');
             if (!require_auth($u, $tk)) { echo json_encode(['ok'=>false,'msg'=>'Unauthorized']); exit; }
             $key = key_resolve($u);
             key_update($key, function($d) { $d['config']['stuck_pred'] = null; return $d; });
-            key_log($key, 'info', '[V93] Reset stuck → quay lại tính CT');
+            key_log($key, 'info', '[V10] Reset stuck → quay lại tính CT');
             echo json_encode(['ok'=>true]);
             exit;
 
@@ -1008,7 +1061,6 @@ try {
                 }, $sessions), 0, 30);
                 if ($latestId > 0) $compute = denius_compute($sessions, $latestId);
             }
-            // Next bet simulation
             $cfg = $s['config'] ?? [];
             $betStreak = (int)($cfg['bet_streak'] ?? 0);
             $baseBet = (int)($cfg['base_bet'] ?? 0);
@@ -1017,8 +1069,9 @@ try {
             $nextBetAmt = $baseBet * $mult;
             if ($bal > 0 && $nextBetAmt > $bal) $nextBetAmt = $bal;
             echo json_encode([
-                'ok'=>true, 'table'=>'MD5', 'version'=>'v9.3',
+                'ok'=>true, 'table'=>'MD5', 'version'=>'v10.0',
                 'ws_host'=>$CFG['game']['ws_host'],
+                'b_offset'=>$CFG['game']['b_offset'],
                 'config'=>$cfg,
                 'state'=>[
                     'balance'=>$bal,
@@ -1044,7 +1097,6 @@ try {
                 ],
                 'sessions_api_result'=>$sessInfo,
                 'compute_next'=>$compute,
-                'b_offset'=>$CFG['game']['b_offset'],
             ]);
             exit;
     }
@@ -1061,135 +1113,490 @@ function render_ui(): void { ?>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
-<meta name="theme-color" content="#05020f">
-<title>DENIUS v9.3 · MD5</title>
+<meta name="theme-color" content="#ffd0e6">
+<title>DENIUS v10 · SAKURA DREAM</title>
 <style>
-:root{--bg:#05020f;--sakura:#ffb7d5;--gold:#ffd966;--mint:#7ef0b4;--ruby:#ff5c7a;--cyan:#6ee7ff;--text:#fff5eb;--dim:#a89cbd;--muted:#5e4d75;--bd:rgba(255,183,213,0.15)}
+:root{
+  --bg-1:#ffe4f0;--bg-2:#ffd0e6;--bg-3:#ffc0dd;
+  --pink-1:#ff6ba8;--pink-2:#ff4d94;--pink-3:#ff8fc3;
+  --rose:#e63980;--rose-deep:#c2185b;
+  --gold:#ffb84d;--gold-bright:#ffd966;
+  --mint:#4ecca3;--cyan:#5ec8ff;--violet:#a78bfa;
+  --text:#3d1e2e;--text-dim:#8a5a72;--muted:#b890a5;
+  --white:#ffffff;
+  --glass-bg:rgba(255,255,255,0.75);
+  --glass-border:rgba(255,109,168,0.35);
+  --shadow-pink:0 8px 32px rgba(255,77,148,0.25);
+}
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html{height:100dvh;overflow:hidden;font-size:16px}
-body{height:100dvh;overflow:hidden;position:fixed;inset:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;user-select:none;touch-action:manipulation;overscroll-behavior:none}
-#app{position:absolute;inset:0;display:flex;flex-direction:column;overflow:hidden}
+body{
+  height:100dvh;overflow:hidden;position:fixed;inset:0;
+  background:linear-gradient(135deg,var(--bg-1) 0%,var(--bg-2) 50%,var(--bg-3) 100%);
+  background-attachment:fixed;
+  color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,"Noto Sans JP","Segoe UI",system-ui,sans-serif;
+  user-select:none;touch-action:manipulation;overscroll-behavior:none;
+}
+/* Animated gradient background */
+.bg-layer{
+  position:fixed;inset:-20%;z-index:0;pointer-events:none;
+  background:
+    radial-gradient(circle at 20% 30%,rgba(255,109,168,0.55),transparent 40%),
+    radial-gradient(circle at 80% 20%,rgba(255,180,220,0.6),transparent 45%),
+    radial-gradient(circle at 60% 80%,rgba(167,139,250,0.35),transparent 40%),
+    radial-gradient(circle at 30% 90%,rgba(255,217,102,0.35),transparent 45%);
+  animation:meshRotate 30s linear infinite;filter:blur(40px);opacity:0.85;
+}
+@keyframes meshRotate{to{transform:rotate(360deg)}}
+/* Particles */
+#particles{position:fixed;inset:0;z-index:1;pointer-events:none;opacity:0.9}
+/* Floating petals */
+.petal{
+  position:fixed;width:14px;height:14px;z-index:1;pointer-events:none;
+  background:radial-gradient(ellipse at 30% 30%,#fff,#ff9dcc 60%,#ff6ba8 90%);
+  border-radius:50% 0 50% 50%;opacity:0.6;
+  animation:petalFall linear infinite;
+  filter:drop-shadow(0 0 6px rgba(255,109,168,0.7));
+}
+@keyframes petalFall{
+  0%{transform:translateY(-30px) translateX(0) rotate(0);opacity:0}
+  10%{opacity:0.7}
+  90%{opacity:0.6}
+  100%{transform:translateY(105vh) translateX(80px) rotate(540deg);opacity:0}
+}
+/* Orbs */
+.orb{
+  position:fixed;border-radius:50%;pointer-events:none;z-index:0;
+  filter:blur(60px);opacity:0.55;
+  animation:orbFloat 20s ease-in-out infinite;
+}
+.orb-1{width:340px;height:340px;top:-10%;left:-8%;background:radial-gradient(circle,#ff6ba8,transparent 70%);animation-delay:0s}
+.orb-2{width:380px;height:380px;bottom:-12%;right:-10%;background:radial-gradient(circle,#a78bfa,transparent 70%);animation-delay:-7s}
+.orb-3{width:300px;height:300px;top:40%;right:20%;background:radial-gradient(circle,#ffd966,transparent 70%);animation-delay:-14s}
+@keyframes orbFloat{
+  0%,100%{transform:translate(0,0) scale(1)}
+  25%{transform:translate(40px,-50px) scale(1.12)}
+  50%{transform:translate(-30px,40px) scale(0.94)}
+  75%{transform:translate(50px,30px) scale(1.08)}
+}
+/* App layout */
+#app{position:absolute;inset:0;z-index:2;display:flex;flex-direction:column;overflow:hidden}
 .screen{flex:1;display:flex;flex-direction:column;overflow:hidden;min-height:0}
-.glass{background:linear-gradient(135deg,rgba(28,15,56,0.75),rgba(10,6,24,0.9));backdrop-filter:blur(30px);-webkit-backdrop-filter:blur(30px);border:1px solid var(--bd);border-radius:20px}
-.wrap{flex:1;display:flex;align-items:center;justify-content:center;padding:20px;overflow-y:auto}
-.card{width:100%;max-width:400px;padding:32px 24px;position:relative;animation:pop 0.6s cubic-bezier(0.34,1.56,0.64,1)}
-@keyframes pop{from{opacity:0;transform:scale(0.9) translateY(30px)}to{opacity:1;transform:scale(1) translateY(0)}}
-.logo{width:100px;height:100px;border-radius:50%;border:2px solid var(--sakura);background:#120828;box-shadow:0 0 40px rgba(255,183,213,0.5);animation:float 3s ease-in-out infinite;margin-bottom:14px;object-fit:cover;display:block;margin-left:auto;margin-right:auto}
-@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}
-.brand{font-size:24px;font-weight:900;letter-spacing:5px;text-align:center;background:linear-gradient(90deg,#ffd6e8,#ffe89a,#6ee7ff,#ffd6e8);background-size:300% 100%;-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:4px;animation:shim 4s linear infinite}
-@keyframes shim{to{background-position:300% 0}}
-.brand-sub{text-align:center;font-size:11px;letter-spacing:2px;color:var(--dim);font-weight:600;margin-bottom:22px}
-.brand-sub b{color:var(--cyan)}
-.field{margin-bottom:14px}
-.field label{display:block;font-size:10px;font-weight:800;color:var(--dim);text-transform:uppercase;letter-spacing:1.5px;margin-bottom:6px}
-.field input{width:100%;padding:14px 16px;background:rgba(5,2,15,0.8);border:1px solid var(--bd);border-radius:14px;color:var(--text);font-size:16px;outline:none;font-family:inherit;transition:all 0.25s}
-.field input:focus{border-color:var(--sakura);box-shadow:0 0 0 3px rgba(255,183,213,0.15)}
-.btn{width:100%;padding:15px;border:none;border-radius:14px;font-size:13px;font-weight:900;letter-spacing:2px;text-transform:uppercase;cursor:pointer;transition:all 0.3s;font-family:inherit;margin-top:8px;position:relative;overflow:hidden;background:linear-gradient(135deg,#ffd6e8,#ffb7d5);color:#1a0d33;box-shadow:0 8px 28px -8px rgba(255,183,213,0.5)}
-.btn:hover:not(:disabled){transform:translateY(-2px);box-shadow:0 12px 36px -8px rgba(255,183,213,0.7)}
+/* Glass card */
+.glass{
+  background:var(--glass-bg);
+  backdrop-filter:blur(24px) saturate(180%);
+  -webkit-backdrop-filter:blur(24px) saturate(180%);
+  border:1.5px solid var(--glass-border);
+  border-radius:24px;
+  box-shadow:
+    0 12px 40px rgba(255,77,148,0.2),
+    0 0 0 1px rgba(255,255,255,0.5) inset,
+    0 0 40px -10px rgba(255,109,168,0.4);
+  position:relative;
+  overflow:hidden;
+}
+.glass::before{
+  content:'';position:absolute;top:0;left:0;right:0;height:1.5px;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,0.9),transparent);
+  opacity:0.7;
+}
+/* Glow border animated */
+@property --angle{syntax:'<angle>';initial-value:0deg;inherits:false}
+.neon::after{
+  content:'';position:absolute;inset:-2px;border-radius:inherit;padding:2px;
+  background:conic-gradient(from var(--angle),transparent 0%,var(--pink-1) 25%,var(--gold) 50%,var(--violet) 75%,transparent 100%);
+  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor;mask-composite:exclude;
+  animation:spin 5s linear infinite;pointer-events:none;opacity:0.85;
+}
+@keyframes spin{to{--angle:360deg}}
+/* Layout helpers */
+.wrap{flex:1;display:flex;align-items:center;justify-content:center;padding:20px;overflow-y:auto;position:relative;z-index:1}
+.card{width:100%;max-width:400px;padding:34px 26px 30px;position:relative;animation:popIn 0.7s cubic-bezier(0.34,1.56,0.64,1)}
+@keyframes popIn{from{opacity:0;transform:scale(0.9) translateY(40px);filter:blur(10px)}to{opacity:1;transform:scale(1) translateY(0);filter:blur(0)}}
+/* Logo */
+.logo{
+  width:110px;height:110px;border-radius:50%;object-fit:cover;
+  border:3px solid #fff;background:#fff;
+  box-shadow:
+    0 0 0 4px rgba(255,109,168,0.3),
+    0 8px 32px rgba(255,77,148,0.5),
+    0 0 60px rgba(255,109,168,0.5);
+  margin:0 auto 16px;display:block;
+  animation:logoFloat 3.5s ease-in-out infinite;
+}
+@keyframes logoFloat{0%,100%{transform:translateY(0) rotate(-2deg)}50%{transform:translateY(-10px) rotate(2deg)}}
+/* Brand */
+.brand{
+  font-size:28px;font-weight:900;letter-spacing:6px;text-align:center;
+  background:linear-gradient(90deg,#ff4d94,#ff8fc3,#ffb84d,#ff4d94);
+  background-size:300% 100%;
+  -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
+  margin-bottom:6px;
+  animation:shimmerText 4s linear infinite;
+  filter:drop-shadow(0 2px 8px rgba(255,77,148,0.4));
+}
+@keyframes shimmerText{to{background-position:300% 0}}
+.brand-sub{
+  text-align:center;font-size:12px;letter-spacing:3px;
+  color:var(--text-dim);font-weight:700;margin-bottom:26px;
+}
+.brand-sub b{color:var(--pink-2);text-shadow:0 0 8px rgba(255,77,148,0.4)}
+/* Field */
+.field{margin-bottom:16px}
+.field label{
+  display:block;font-size:11px;font-weight:800;color:var(--text-dim);
+  text-transform:uppercase;letter-spacing:1.5px;margin-bottom:8px;
+}
+.field input{
+  width:100%;padding:15px 18px;
+  background:rgba(255,255,255,0.85);
+  border:2px solid rgba(255,109,168,0.25);
+  border-radius:16px;
+  color:var(--text);font-size:16px;outline:none;font-family:inherit;
+  transition:all 0.3s;
+  box-shadow:inset 0 1px 4px rgba(255,109,168,0.08);
+}
+.field input:focus{
+  border-color:var(--pink-2);
+  background:#fff;
+  box-shadow:0 0 0 4px rgba(255,77,148,0.15),0 4px 20px rgba(255,77,148,0.2);
+}
+.field input::placeholder{color:var(--muted)}
+/* Button */
+.btn{
+  width:100%;padding:16px;border:none;border-radius:16px;
+  font-size:14px;font-weight:900;letter-spacing:2px;text-transform:uppercase;
+  cursor:pointer;transition:all 0.3s;font-family:inherit;
+  margin-top:10px;position:relative;overflow:hidden;
+  background:linear-gradient(135deg,#ff4d94,#ff6ba8,#ff8fc3);
+  color:#fff;
+  box-shadow:0 10px 32px rgba(255,77,148,0.4),inset 0 1px 0 rgba(255,255,255,0.4);
+}
+.btn::before{
+  content:'';position:absolute;top:0;left:-100%;width:100%;height:100%;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,0.5),transparent);
+  transition:left 0.6s;
+}
+.btn:hover:not(:disabled)::before{left:100%}
+.btn:hover:not(:disabled){
+  transform:translateY(-2px);
+  box-shadow:0 14px 40px rgba(255,77,148,0.6),inset 0 1px 0 rgba(255,255,255,0.4);
+}
+.btn:active{transform:scale(0.98)}
 .btn:disabled{opacity:0.5;cursor:not-allowed}
-.msg{margin-top:12px;padding:12px 16px;border-radius:12px;font-size:12px}
-.msg.err{background:rgba(255,92,122,0.1);border:1px solid rgba(255,92,122,0.3);color:#ffa0b3}
-.msg.warn{background:rgba(255,217,102,0.1);border:1px solid rgba(255,217,102,0.3);color:var(--gold)}
-.msg.stuck{background:rgba(110,231,255,0.1);border:1px solid rgba(110,231,255,0.3);color:var(--cyan)}
-.foot{margin-top:20px;text-align:center;font-size:10px;color:var(--muted);line-height:1.8}
-.foot b{color:var(--sakura)}
-.close-btn{position:absolute;top:12px;right:12px;width:34px;height:34px;border-radius:50%;background:rgba(255,92,122,0.15);border:1px solid rgba(255,92,122,0.4);color:var(--ruby);font-size:16px;font-weight:900;cursor:pointer;display:flex;align-items:center;justify-content:center;font-family:inherit}
-.back-btn{position:absolute;top:12px;left:12px;padding:6px 12px;border-radius:20px;background:rgba(255,183,213,0.1);border:1px solid var(--bd);color:var(--dim);font-size:10px;font-weight:800;cursor:pointer;font-family:inherit;letter-spacing:1px}
-.avatar{width:80px;height:80px;border-radius:50%;margin:0 auto 14px;background:linear-gradient(135deg,#ffb7d5,#c4a7e7);display:flex;align-items:center;justify-content:center;font-size:36px;font-weight:900;color:#1a0d33;box-shadow:0 0 40px rgba(255,183,213,0.5)}
-.greet{font-size:14px;color:var(--sakura);font-weight:700;text-align:center;margin-bottom:4px}
-.name{font-size:22px;font-weight:900;color:var(--text);text-align:center;margin-bottom:4px}
-.tag{font-size:10px;color:var(--dim);letter-spacing:2px;text-transform:uppercase;font-weight:600;text-align:center}
-.stat{display:flex;justify-content:space-between;padding:14px;background:rgba(255,183,213,0.05);border:1px solid var(--bd);border-radius:14px;margin-top:10px}
-.stat .lbl{font-size:11px;color:var(--dim);font-weight:700}
-.stat .val{font-size:15px;font-weight:900;color:var(--gold);font-family:monospace;text-align:right;overflow-wrap:anywhere}
-.step{font-size:10px;letter-spacing:2px;color:var(--sakura);font-weight:800;text-align:center;margin-bottom:8px}
-.title{font-size:20px;font-weight:900;text-align:center;margin-bottom:6px}
-.sub{font-size:11px;text-align:center;color:var(--dim);line-height:1.6;margin-bottom:20px}
-.hint{font-size:10px;color:var(--dim);background:rgba(255,183,213,0.06);border:1px solid rgba(255,183,213,0.15);border-radius:10px;padding:12px 14px;margin-top:14px;line-height:1.6;text-align:left}
-.hint b{color:var(--sakura)}
-.header{display:flex;align-items:center;gap:12px;padding:12px 16px;margin:12px 12px 0}
-.hlogo{width:44px;height:44px;border-radius:50%;border:1.5px solid var(--sakura);background:#120828;flex-shrink:0;object-fit:cover}
+/* Messages */
+.msg{
+  margin-top:14px;padding:13px 16px;border-radius:14px;font-size:12px;
+  font-weight:600;display:flex;align-items:center;gap:8px;
+  animation:fadeIn 0.4s;
+}
+@keyframes fadeIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}
+.msg.err{background:rgba(230,57,128,0.12);border:1.5px solid rgba(230,57,128,0.4);color:var(--rose)}
+.msg.warn{background:rgba(255,184,77,0.15);border:1.5px solid rgba(255,184,77,0.4);color:#b87500}
+.msg.stuck{background:rgba(94,200,255,0.15);border:1.5px solid rgba(94,200,255,0.45);color:#0b6fa0}
+.msg.success{background:rgba(78,204,163,0.15);border:1.5px solid rgba(78,204,163,0.45);color:#0d7a5c}
+/* Foot */
+.foot{margin-top:22px;text-align:center;font-size:10px;color:var(--muted);line-height:1.8;letter-spacing:0.5px}
+.foot b{color:var(--pink-2)}
+/* Info card */
+.avatar{
+  width:86px;height:86px;border-radius:50%;margin:0 auto 16px;
+  background:linear-gradient(135deg,#ff6ba8,#ffb84d);
+  display:flex;align-items:center;justify-content:center;
+  font-size:38px;font-weight:900;color:#fff;
+  box-shadow:0 0 0 4px rgba(255,255,255,0.8),0 8px 32px rgba(255,77,148,0.5),0 0 60px rgba(255,109,168,0.5);
+  animation:avatarPop 0.7s cubic-bezier(0.34,1.56,0.64,1) 0.2s both;
+}
+@keyframes avatarPop{from{transform:scale(0);opacity:0}to{transform:scale(1);opacity:1}}
+.greet{font-size:15px;color:var(--pink-2);font-weight:800;text-align:center;margin-bottom:6px;letter-spacing:1px}
+.name{font-size:24px;font-weight:900;color:var(--text);text-align:center;margin-bottom:6px}
+.tag{font-size:10px;color:var(--text-dim);letter-spacing:2.5px;text-transform:uppercase;font-weight:700;text-align:center;margin-bottom:8px}
+.stat{
+  display:flex;justify-content:space-between;padding:15px 18px;
+  background:rgba(255,255,255,0.75);
+  border:1.5px solid rgba(255,109,168,0.2);
+  border-radius:16px;margin-top:11px;
+  transition:all 0.25s;
+}
+.stat:hover{transform:translateY(-2px);box-shadow:0 6px 20px rgba(255,77,148,0.15)}
+.stat .lbl{font-size:12px;color:var(--text-dim);font-weight:700}
+.stat .val{font-size:15px;font-weight:900;color:var(--rose);font-family:monospace;text-align:right;overflow-wrap:anywhere}
+/* Setup steps */
+.step{font-size:11px;letter-spacing:2.5px;color:var(--pink-2);font-weight:900;text-align:center;margin-bottom:10px}
+.title{font-size:22px;font-weight:900;text-align:center;margin-bottom:8px;color:var(--text)}
+.sub{font-size:12px;text-align:center;color:var(--text-dim);line-height:1.7;margin-bottom:22px}
+.hint{
+  font-size:11px;color:var(--text-dim);
+  background:rgba(255,255,255,0.6);
+  border:1.5px solid rgba(255,109,168,0.2);
+  border-radius:14px;padding:14px 16px;margin-top:16px;
+  line-height:1.7;text-align:left;
+}
+.hint b{color:var(--pink-2);font-weight:800}
+.hint code{
+  background:rgba(255,77,148,0.12);padding:2px 6px;border-radius:6px;
+  color:var(--rose);font-family:monospace;font-size:10px;
+}
+/* Back/Close buttons */
+.close-btn{
+  position:absolute;top:14px;right:14px;width:36px;height:36px;
+  border-radius:50%;background:rgba(230,57,128,0.12);
+  border:1.5px solid rgba(230,57,128,0.35);
+  color:var(--rose);font-size:17px;font-weight:900;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;font-family:inherit;
+  transition:all 0.25s;z-index:2;
+}
+.close-btn:hover{background:rgba(230,57,128,0.25);transform:rotate(90deg)}
+.back-btn{
+  position:absolute;top:14px;left:14px;padding:7px 14px;
+  border-radius:20px;background:rgba(255,109,168,0.15);
+  border:1.5px solid rgba(255,109,168,0.3);
+  color:var(--pink-2);font-size:11px;font-weight:800;cursor:pointer;
+  font-family:inherit;letter-spacing:0.5px;transition:all 0.25s;z-index:2;
+}
+.back-btn:hover{background:rgba(255,109,168,0.25);transform:translateY(-1px)}
+/* Header main */
+.header{display:flex;align-items:center;gap:12px;padding:14px 16px;margin:12px 12px 0}
+.hlogo{
+  width:46px;height:46px;border-radius:50%;object-fit:cover;
+  border:2px solid #fff;background:#fff;flex-shrink:0;
+  box-shadow:0 0 0 3px rgba(255,109,168,0.3),0 4px 16px rgba(255,77,148,0.4);
+}
 .hbrand{flex:1;min-width:0}
-.hbrand h1{font-size:13px;font-weight:900;letter-spacing:2px;background:linear-gradient(90deg,#ffd6e8,#ffe89a);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
-.hbrand small{display:block;font-size:9px;color:var(--cyan);letter-spacing:1px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700}
-.hact{display:flex;gap:6px}
-.act{width:36px;height:36px;border-radius:50%;border:1px solid var(--bd);background:rgba(28,15,56,0.6);color:var(--dim);font-size:15px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-family:inherit;transition:all 0.2s}
-.act.kill{color:var(--ruby);border-color:rgba(255,92,122,0.35);background:rgba(255,92,122,0.1)}
-.act.logout{color:var(--gold);border-color:rgba(255,217,102,0.35);background:rgba(255,217,102,0.1)}
-.scroll{flex:1;overflow-y:auto;padding:14px 12px 96px}
-.bal-card{padding:20px;margin-bottom:14px}
-.bal-lbl{font-size:9px;letter-spacing:2px;color:var(--dim);font-weight:800;text-transform:uppercase;margin-bottom:8px}
-.bal-val{font-size:32px;font-weight:900;color:var(--gold);font-family:"SF Mono",Consolas,monospace;line-height:1;text-shadow:0 0 24px rgba(255,217,102,0.5);transition:all 0.3s;display:inline-block}
-.bal-val.upd{color:var(--mint);transform:scale(1.05)}
-.bal-suf{font-size:18px;color:var(--dim);margin-left:6px}
-.res-card{padding:28px 20px;margin-bottom:14px;text-align:center;min-height:260px;display:flex;flex-direction:column;align-items:center;justify-content:center;position:relative}
-.res-sess{font-size:10px;letter-spacing:2px;color:var(--dim);font-weight:800;text-transform:uppercase;margin-bottom:14px}
-.res-lbl{font-size:11px;color:var(--dim);letter-spacing:3px;font-weight:700;text-transform:uppercase;margin-bottom:12px}
-.res-val{font-size:60px;font-weight:900;letter-spacing:4px;margin-bottom:8px}
-.res-val.tai{background:linear-gradient(135deg,#7ec8ff,#4a9eff,#7ec8ff);background-size:200% 100%;-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;animation:shim 3s linear infinite;filter:drop-shadow(0 0 30px rgba(78,158,255,0.7))}
-.res-val.xiu{background:linear-gradient(135deg,#ff8fa0,#ff5c7a,#ff8fa0);background-size:200% 100%;-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;animation:shim 3s linear infinite;filter:drop-shadow(0 0 30px rgba(255,92,122,0.7))}
-.res-val.wait{color:var(--muted);font-size:36px}
-.stuck-badge{position:absolute;top:10px;right:10px;padding:5px 10px;background:rgba(110,231,255,0.15);border:1px solid rgba(110,231,255,0.5);color:var(--cyan);border-radius:20px;font-size:9px;font-weight:900;letter-spacing:0.5px;animation:pulseStuck 2s infinite}
-@keyframes pulseStuck{0%,100%{box-shadow:0 0 0 rgba(110,231,255,0.4)}50%{box-shadow:0 0 16px rgba(110,231,255,0.7)}}
-.out{margin-top:18px;padding-top:18px;border-top:1px dashed rgba(255,183,213,0.2);width:100%;display:none}
-.out.show{display:block}
-.out .big{font-size:26px;font-weight:900;letter-spacing:2px;margin-bottom:6px}
-.out .big.win{color:var(--mint)}
-.out .big.lose{color:var(--ruby)}
-.out .big.jp{background:linear-gradient(90deg,#fff,#ffd966,#fff);background-size:200% 100%;-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;animation:shim 2s linear infinite}
-.out .det{font-size:12px;color:var(--dim);font-family:monospace;line-height:1.7}
-.out .det b{color:var(--gold)}
-.bet-card{padding:16px 20px;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;gap:14px;background:linear-gradient(135deg,rgba(255,183,213,0.1),rgba(28,15,56,0.85))}
-.bet-lbl{font-size:10px;letter-spacing:2px;color:var(--dim);font-weight:800;text-transform:uppercase;margin-bottom:6px}
-.bet-val{font-size:22px;font-weight:900;color:var(--gold);font-family:monospace;text-shadow:0 0 20px rgba(255,217,102,0.5);transition:all 0.3s}
+.hbrand h1{
+  font-size:14px;font-weight:900;letter-spacing:2.5px;
+  background:linear-gradient(90deg,#ff4d94,#ffb84d);
+  -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
+}
+.hbrand small{display:block;font-size:10px;color:var(--pink-2);letter-spacing:1px;margin-top:2px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hact{display:flex;gap:8px}
+.act{
+  width:38px;height:38px;border-radius:50%;border:1.5px solid rgba(255,109,168,0.35);
+  background:rgba(255,255,255,0.7);color:var(--text-dim);
+  font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center;
+  font-family:inherit;transition:all 0.25s;backdrop-filter:blur(10px);
+}
+.act.kill{color:var(--rose);border-color:rgba(230,57,128,0.4);background:rgba(230,57,128,0.12)}
+.act.kill:hover{background:rgba(230,57,128,0.25);transform:scale(1.1)}
+.act.logout{color:#b87500;border-color:rgba(255,184,77,0.4);background:rgba(255,184,77,0.15)}
+.act.logout:hover{background:rgba(255,184,77,0.3);transform:scale(1.1)}
+/* Scroll area */
+.scroll{flex:1;overflow-y:auto;padding:14px 12px 100px;position:relative;z-index:1}
+/* Balance card */
+.bal-card{padding:22px 22px;margin-bottom:14px;position:relative;overflow:visible}
+.bal-lbl{
+  font-size:10px;letter-spacing:2.5px;color:var(--text-dim);font-weight:900;
+  text-transform:uppercase;margin-bottom:10px;
+  display:flex;align-items:center;gap:6px;
+}
+.bal-lbl::before{content:'💎';font-size:14px}
+.bal-val{
+  font-size:36px;font-weight:900;color:var(--rose-deep);
+  font-family:"SF Mono","Consolas",monospace;line-height:1;
+  text-shadow:0 2px 16px rgba(255,77,148,0.4),0 0 32px rgba(255,109,168,0.3);
+  transition:all 0.4s;display:inline-block;
+}
+.bal-val.upd{color:var(--mint);transform:scale(1.06);text-shadow:0 2px 16px rgba(78,204,163,0.5)}
+.bal-suf{font-size:20px;color:var(--text-dim);margin-left:8px;font-weight:700}
+/* Result card */
+.res-card{
+  padding:30px 22px;margin-bottom:14px;text-align:center;
+  min-height:270px;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;position:relative;
+}
+.res-sess{
+  font-size:11px;letter-spacing:2.5px;color:var(--text-dim);
+  font-weight:900;text-transform:uppercase;margin-bottom:16px;
+}
+.res-lbl{
+  font-size:12px;color:var(--text-dim);letter-spacing:3px;
+  font-weight:800;text-transform:uppercase;margin-bottom:14px;
+}
+.res-val{
+  font-size:64px;font-weight:900;letter-spacing:5px;
+  margin-bottom:10px;position:relative;
+}
+.res-val.tai{
+  background:linear-gradient(135deg,#5ec8ff,#3aa3ff,#5ec8ff);
+  background-size:200% 100%;
+  -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
+  animation:shimmerText 2.5s linear infinite;
+  filter:drop-shadow(0 4px 20px rgba(94,200,255,0.7)) drop-shadow(0 0 40px rgba(94,200,255,0.5));
+}
+.res-val.xiu{
+  background:linear-gradient(135deg,#ff4d94,#e63980,#ff4d94);
+  background-size:200% 100%;
+  -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
+  animation:shimmerText 2.5s linear infinite;
+  filter:drop-shadow(0 4px 20px rgba(255,77,148,0.7)) drop-shadow(0 0 40px rgba(255,77,148,0.5));
+}
+.res-val.wait{color:var(--muted);font-size:40px;letter-spacing:4px}
+/* Stuck badge */
+.stuck-badge{
+  position:absolute;top:14px;right:14px;
+  padding:6px 12px;
+  background:linear-gradient(135deg,rgba(94,200,255,0.2),rgba(94,200,255,0.3));
+  border:1.5px solid rgba(94,200,255,0.6);
+  color:#0b6fa0;border-radius:24px;
+  font-size:10px;font-weight:900;letter-spacing:1px;
+  animation:pulseStuck 2s infinite;
+}
+@keyframes pulseStuck{
+  0%,100%{box-shadow:0 0 0 rgba(94,200,255,0.4)}
+  50%{box-shadow:0 0 20px rgba(94,200,255,0.8)}
+}
+/* Outcome */
+.out{margin-top:20px;padding-top:20px;border-top:1.5px dashed rgba(255,109,168,0.3);width:100%;display:none}
+.out.show{display:block;animation:fadeIn 0.5s}
+.out .big{font-size:28px;font-weight:900;letter-spacing:2px;margin-bottom:8px}
+.out .big.win{color:var(--mint);text-shadow:0 2px 20px rgba(78,204,163,0.5)}
+.out .big.lose{color:var(--rose);text-shadow:0 2px 20px rgba(230,57,128,0.5)}
+.out .big.jp{
+  background:linear-gradient(90deg,#ff4d94,#ffb84d,#ff4d94);
+  background-size:200% 100%;
+  -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
+  animation:shimmerText 2s linear infinite;
+  filter:drop-shadow(0 4px 20px rgba(255,184,77,0.8));
+}
+.out .det{font-size:13px;color:var(--text-dim);font-family:monospace;line-height:1.8;font-weight:600}
+.out .det b{color:var(--rose);font-weight:900}
+/* Bet card */
+.bet-card{
+  padding:18px 22px;margin-bottom:14px;
+  display:flex;align-items:center;justify-content:space-between;gap:14px;
+  background:linear-gradient(135deg,rgba(255,109,168,0.15),rgba(255,255,255,0.75));
+}
+.bet-lbl{font-size:10px;letter-spacing:2px;color:var(--text-dim);font-weight:900;text-transform:uppercase;margin-bottom:6px;display:flex;align-items:center;gap:6px}
+.bet-lbl::before{content:'🎰';font-size:12px}
+.bet-val{font-size:24px;font-weight:900;color:var(--rose-deep);font-family:monospace;text-shadow:0 2px 12px rgba(255,77,148,0.4);transition:all 0.3s}
 .bet-val.pulse{animation:bpulse 0.6s}
-@keyframes bpulse{50%{transform:scale(1.15);color:var(--sakura)}}
+@keyframes bpulse{50%{transform:scale(1.12);color:var(--pink-2)}}
 .bet-str{text-align:right}
-.bet-str small{font-size:9px;color:var(--dim);letter-spacing:1px;font-weight:700;text-transform:uppercase;display:block}
-.bet-str b{font-size:15px;font-weight:900;color:var(--sakura);font-family:monospace;display:block;margin-top:2px}
-.prog{padding:14px 20px;margin-bottom:14px}
-.prog-lbl{display:flex;justify-content:space-between;font-size:10px;font-weight:800;margin-bottom:8px;color:var(--dim)}
-.prog-lbl b{color:var(--gold);font-family:monospace}
-.prog-bar{height:10px;background:rgba(255,183,213,0.1);border-radius:5px;overflow:hidden;border:1px solid rgba(255,183,213,0.15)}
-.prog-fill{height:100%;background:linear-gradient(90deg,#ffb7d5,#ffd966,#7ef0b4);border-radius:5px;transition:width 0.6s;box-shadow:0 0 14px rgba(255,183,213,0.7)}
-.nav{position:absolute;bottom:0;left:0;right:0;padding:10px 20px 14px;display:flex;justify-content:center;gap:8px;background:linear-gradient(180deg,rgba(5,2,15,0.3),rgba(5,2,15,0.98) 40%);backdrop-filter:blur(20px);border-top:1px solid var(--bd);z-index:10}
-.nav-btn{flex:1;max-width:180px;padding:12px 16px;background:rgba(28,15,56,0.7);border:1px solid var(--bd);color:var(--dim);font-size:11px;font-weight:800;letter-spacing:1px;border-radius:14px;cursor:pointer;font-family:inherit;text-transform:uppercase;transition:all 0.2s}
-.nav-btn.on{background:linear-gradient(135deg,#ffd6e8,#ffb7d5);color:#1a0d33;border-color:transparent;box-shadow:0 6px 20px -6px rgba(255,183,213,0.6)}
-.h-head{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;margin:12px 12px 0}
-.h-title{font-size:14px;font-weight:900;color:var(--sakura);letter-spacing:2px;text-transform:uppercase}
-.h-count{font-size:10px;color:var(--dim);font-weight:700;padding:4px 10px;background:rgba(255,183,213,0.1);border-radius:20px;border:1px solid var(--bd)}
-.h-scroll{flex:1;overflow-y:auto;padding:14px 12px 96px}
-.h-row{padding:14px 16px;margin-bottom:8px;background:linear-gradient(135deg,rgba(28,15,56,0.7),rgba(10,6,24,0.85));border:1px solid var(--bd);border-radius:14px;display:flex;align-items:center;gap:12px;border-left:3px solid var(--muted)}
-.h-row.win{border-left-color:var(--mint)}
-.h-row.lose{border-left-color:var(--ruby)}
-.h-row.jp{border-left-color:var(--gold);background:linear-gradient(135deg,rgba(255,217,102,0.12),rgba(10,6,24,0.85))}
+.bet-str small{font-size:9px;color:var(--text-dim);letter-spacing:1.5px;font-weight:900;text-transform:uppercase;display:block}
+.bet-str b{font-size:16px;font-weight:900;color:var(--pink-2);font-family:monospace;display:block;margin-top:2px;text-shadow:0 2px 8px rgba(255,77,148,0.3)}
+/* Progress */
+.prog{padding:16px 22px;margin-bottom:14px}
+.prog-lbl{display:flex;justify-content:space-between;font-size:11px;font-weight:900;margin-bottom:10px;color:var(--text-dim);letter-spacing:0.5px}
+.prog-lbl b{color:var(--rose);font-family:monospace}
+.prog-bar{
+  height:12px;background:rgba(255,109,168,0.15);border-radius:6px;
+  overflow:hidden;border:1.5px solid rgba(255,109,168,0.25);
+}
+.prog-fill{
+  height:100%;
+  background:linear-gradient(90deg,#ff4d94,#ff8fc3,#ffb84d,#ffd966);
+  background-size:200% 100%;
+  border-radius:6px;transition:width 0.6s;
+  box-shadow:0 0 16px rgba(255,77,148,0.7);
+  animation:shimmerBg 2s linear infinite;
+}
+@keyframes shimmerBg{to{background-position:200% 0}}
+/* Nav */
+.nav{
+  position:absolute;bottom:0;left:0;right:0;padding:12px 20px 16px;
+  display:flex;justify-content:center;gap:10px;
+  background:linear-gradient(180deg,rgba(255,228,240,0.4),rgba(255,208,230,0.98) 40%);
+  backdrop-filter:blur(20px);
+  border-top:1.5px solid rgba(255,109,168,0.2);
+  z-index:10;
+}
+.nav-btn{
+  flex:1;max-width:180px;padding:13px 18px;
+  background:rgba(255,255,255,0.7);
+  border:1.5px solid rgba(255,109,168,0.25);
+  color:var(--text-dim);font-size:12px;font-weight:900;letter-spacing:1px;
+  border-radius:16px;cursor:pointer;font-family:inherit;text-transform:uppercase;
+  transition:all 0.25s;backdrop-filter:blur(10px);
+}
+.nav-btn.on{
+  background:linear-gradient(135deg,#ff4d94,#ff6ba8);
+  color:#fff;border-color:transparent;
+  box-shadow:0 6px 24px rgba(255,77,148,0.5);
+}
+.nav-btn:not(.on):hover{background:rgba(255,255,255,0.9);color:var(--pink-2)}
+/* History */
+.h-head{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;margin:12px 12px 0}
+.h-title{font-size:15px;font-weight:900;color:var(--pink-2);letter-spacing:2px;text-transform:uppercase}
+.h-count{font-size:11px;color:var(--text-dim);font-weight:800;padding:5px 12px;background:rgba(255,109,168,0.15);border-radius:20px;border:1.5px solid rgba(255,109,168,0.3)}
+.h-scroll{flex:1;overflow-y:auto;padding:14px 12px 100px}
+.h-row{
+  padding:15px 18px;margin-bottom:10px;
+  background:rgba(255,255,255,0.75);
+  backdrop-filter:blur(10px);
+  border:1.5px solid rgba(255,109,168,0.2);
+  border-radius:16px;display:flex;align-items:center;gap:12px;
+  border-left:4px solid var(--muted);
+  transition:all 0.2s;
+}
+.h-row:hover{transform:translateX(4px)}
+.h-row.win{border-left-color:var(--mint);background:linear-gradient(90deg,rgba(78,204,163,0.1),rgba(255,255,255,0.85))}
+.h-row.lose{border-left-color:var(--rose);background:linear-gradient(90deg,rgba(230,57,128,0.08),rgba(255,255,255,0.85))}
+.h-row.jp{border-left-color:var(--gold);background:linear-gradient(90deg,rgba(255,184,77,0.15),rgba(255,255,255,0.9));box-shadow:0 4px 20px rgba(255,184,77,0.2)}
 .h-row.stuck-lose{border-left-color:var(--cyan)}
-.h-sid{font-family:monospace;color:var(--sakura);font-weight:800;font-size:11px;min-width:60px}
+.h-sid{font-family:monospace;color:var(--pink-2);font-weight:900;font-size:12px;min-width:64px}
 .h-mid{flex:1;min-width:0}
-.h-mid .r1{font-size:12px;font-weight:800;margin-bottom:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.h-mid .r2{font-size:10px;color:var(--dim);font-family:monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.h-amt{font-family:monospace;font-weight:900;font-size:13px;min-width:76px;text-align:right}
+.h-mid .r1{font-size:13px;font-weight:900;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text)}
+.h-mid .r2{font-size:11px;color:var(--text-dim);font-family:monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600}
+.h-amt{font-family:monospace;font-weight:900;font-size:14px;min-width:80px;text-align:right}
 .h-amt.win{color:var(--mint)}
-.h-amt.lose{color:var(--ruby)}
-.empty{padding:60px 20px;text-align:center;color:var(--dim);font-size:12px}
-.empty .icon{font-size:52px;margin-bottom:16px;opacity:0.4;display:block}
-.empty .title{font-size:14px;font-weight:800;color:var(--text);margin-bottom:6px}
-.empty .sub{font-size:11px;color:var(--muted)}
-#toast{position:fixed;top:20px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:8px;pointer-events:none;max-width:340px}
-.toast{padding:12px 18px;border-radius:12px;font-size:12px;font-weight:600;color:#fff;background:rgba(28,15,56,0.98);border:1px solid var(--bd);box-shadow:0 12px 32px -8px rgba(0,0,0,0.6);backdrop-filter:blur(12px);animation:ti 0.35s}
-.toast.success{border-color:rgba(126,240,180,0.4)}
-.toast.error{border-color:rgba(255,92,122,0.4)}
-.toast.gold{border-color:rgba(255,217,102,0.4)}
-.toast.stuck{border-color:rgba(110,231,255,0.4)}
-@keyframes ti{from{opacity:0;transform:translateX(100px)}to{opacity:1;transform:translateX(0)}}
+.h-amt.lose{color:var(--rose)}
+/* Empty */
+.empty{padding:60px 20px;text-align:center;color:var(--text-dim);font-size:13px}
+.empty .icon{font-size:56px;margin-bottom:18px;opacity:0.6;display:block}
+.empty .title{font-size:16px;font-weight:900;color:var(--text);margin-bottom:8px}
+.empty .sub{font-size:12px;color:var(--muted)}
+/* Toast */
+#toast{position:fixed;top:20px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:10px;pointer-events:none;max-width:340px}
+.toast{
+  padding:14px 20px;border-radius:16px;font-size:13px;font-weight:800;
+  color:var(--text);background:rgba(255,255,255,0.98);
+  border:1.5px solid var(--glass-border);
+  box-shadow:0 12px 40px rgba(255,77,148,0.3);
+  backdrop-filter:blur(20px);
+  animation:toastIn 0.4s cubic-bezier(0.34,1.56,0.64,1);
+}
+.toast.success{border-color:rgba(78,204,163,0.6);background:linear-gradient(135deg,rgba(78,204,163,0.15),#fff)}
+.toast.error{border-color:rgba(230,57,128,0.6);background:linear-gradient(135deg,rgba(230,57,128,0.15),#fff)}
+.toast.gold{border-color:rgba(255,184,77,0.6);background:linear-gradient(135deg,rgba(255,184,77,0.15),#fff)}
+.toast.stuck{border-color:rgba(94,200,255,0.6);background:linear-gradient(135deg,rgba(94,200,255,0.15),#fff)}
+@keyframes toastIn{from{opacity:0;transform:translateX(100px)}to{opacity:1;transform:translateX(0)}}
+/* Sparkle */
+.sparkle{
+  position:fixed;width:8px;height:8px;border-radius:50%;pointer-events:none;z-index:9998;
+  animation:sparkleAnim 1s ease-out forwards;
+  box-shadow:0 0 12px currentColor,0 0 24px currentColor;
+}
+@keyframes sparkleAnim{
+  0%{transform:translate(0,0) scale(1);opacity:1}
+  100%{transform:translate(var(--dx),var(--dy)) scale(0);opacity:0}
+}
+/* Responsive */
+@media (max-width:360px){
+  .card{padding:28px 20px}
+  .logo{width:94px;height:94px}
+  .brand{font-size:24px;letter-spacing:4px}
+  .res-val{font-size:54px}
+  .bal-val{font-size:30px}
+}
+@media (prefers-reduced-motion:reduce){
+  .petal,.logo,.brand,.res-val,.orb,.bg-layer{animation:none!important}
+}
 </style>
 </head>
 <body>
+<div class="bg-layer"></div>
+<div class="orb orb-1"></div>
+<div class="orb orb-2"></div>
+<div class="orb orb-3"></div>
+<canvas id="particles"></canvas>
 <div id="app"></div>
 <div id="toast"></div>
 <script>
 const LOGO_URL = 'https://raw.githubusercontent.com/nguyenha783255-wq/LOGO-LC79/main/IMG_20260901_094944_094.jpg';
-const LS_KEY = 'denius_v93_md5';
+const LS_KEY = 'denius_v10';
 const app = document.getElementById('app');
 const toastBox = document.getElementById('toast');
 
@@ -1200,13 +1607,78 @@ const S = {
   history: [], stats: {wins:0,losses:0,total:0,winrate:0,profit:0},
   pendingPred: null, pendingSession: null, pendingBetAmount: null,
   workerAlive: false, lastWsError: null,
-  setupBaseBet: 0, setupTarget: 0, lastJackpotSession: null, lastStuckPred: null,
+  setupBaseBet: 0, setupTarget: 0, lastStuckPred: null,
 };
 
 (function() {
   const d = [navigator.userAgent, navigator.language, screen.width+'x'+screen.height].join('|');
   let h = 0; for (let i = 0; i < d.length; i++) h = ((h << 5) - h) + d.charCodeAt(i), h |= 0;
   S.device = 'ONI-' + Math.abs(h).toString(16).toUpperCase().slice(0, 8);
+})();
+
+// Floating sakura petals
+(function initPetals() {
+  const count = window.innerWidth < 600 ? 12 : 18;
+  for (let i = 0; i < count; i++) {
+    const p = document.createElement('div');
+    p.className = 'petal';
+    p.style.left = Math.random() * 100 + '%';
+    const dur = 9 + Math.random() * 10;
+    p.style.animationDuration = dur + 's';
+    p.style.animationDelay = (Math.random() * dur) + 's';
+    const sz = 10 + Math.random() * 10;
+    p.style.width = sz + 'px';
+    p.style.height = sz + 'px';
+    document.body.appendChild(p);
+  }
+})();
+
+// Particle canvas
+(function initParticles() {
+  const canvas = document.getElementById('particles');
+  const ctx = canvas.getContext('2d');
+  let particles = [];
+  const colors = ['#ff6ba8', '#ff8fc3', '#ffb84d', '#a78bfa', '#5ec8ff', '#4ecca3'];
+  function resize() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+    particles = [];
+    const count = window.innerWidth < 600 ? 30 : 55;
+    for (let i = 0; i < count; i++) {
+      particles.push({
+        x: Math.random() * canvas.width,
+        y: Math.random() * canvas.height,
+        vx: (Math.random() - 0.5) * 0.4,
+        vy: (Math.random() - 0.5) * 0.4,
+        r: Math.random() * 3 + 1,
+        color: colors[Math.floor(Math.random() * colors.length)],
+        alpha: Math.random() * 0.5 + 0.3,
+      });
+    }
+  }
+  function animate() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      p.x += p.vx;
+      p.y += p.vy;
+      if (p.x < 0 || p.x > canvas.width) p.vx *= -1;
+      if (p.y < 0 || p.y > canvas.height) p.vy *= -1;
+      ctx.globalAlpha = p.alpha;
+      ctx.fillStyle = p.color;
+      ctx.shadowColor = p.color;
+      ctx.shadowBlur = 10;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.shadowBlur = 0;
+    ctx.globalAlpha = 1;
+    requestAnimationFrame(animate);
+  }
+  resize();
+  window.addEventListener('resize', resize, {passive: true});
+  animate();
 })();
 
 const fmt = n => (n || 0).toLocaleString('vi-VN');
@@ -1219,6 +1691,28 @@ function toast(msg, type) {
   toastBox.appendChild(el);
   setTimeout(() => { el.style.opacity = '0'; el.style.transform = 'translateX(100px)'; el.style.transition = 'all 0.3s'; }, 2800);
   setTimeout(() => el.remove(), 3200);
+}
+
+function sparkleAround(el) {
+  if (!el) return;
+  const rect = el.getBoundingClientRect();
+  const cx = rect.left + rect.width / 2;
+  const cy = rect.top + rect.height / 2;
+  const colors = ['#ff4d94', '#ff8fc3', '#ffb84d', '#5ec8ff', '#4ecca3'];
+  for (let i = 0; i < 16; i++) {
+    const s = document.createElement('div');
+    s.className = 'sparkle';
+    s.style.left = cx + 'px';
+    s.style.top = cy + 'px';
+    s.style.background = colors[i % colors.length];
+    s.style.color = colors[i % colors.length];
+    const angle = (Math.PI * 2 * i) / 16;
+    const dist = 70 + Math.random() * 70;
+    s.style.setProperty('--dx', Math.cos(angle) * dist + 'px');
+    s.style.setProperty('--dy', Math.sin(angle) * dist + 'px');
+    document.body.appendChild(s);
+    setTimeout(() => s.remove(), 1000);
+  }
 }
 
 function saveAuth(u, t, n) { try { localStorage.setItem(LS_KEY, JSON.stringify({u,t,n,ts:Date.now()})); } catch(e) {} }
@@ -1238,15 +1732,15 @@ function render() {
 
 function renderLogin() {
   app.innerHTML =
-    '<div class="screen"><div class="wrap"><div class="card glass">' +
+    '<div class="screen"><div class="wrap"><div class="card glass neon">' +
     '<img src="' + LOGO_URL + '" class="logo" onerror="this.style.display=\'none\'">' +
     '<div class="brand">DENIUS</div>' +
-    '<div class="brand-sub">お兄ちゃん · <b>MD5</b> · v9.3</div>' +
+    '<div class="brand-sub">お兄ちゃん · <b>MD5</b> · SAKURA DREAM</div>' +
     '<div class="field"><label>👤 TÀI KHOẢN</label><input id="in_u" type="text" placeholder="Nhập tài khoản..." value="' + esc(S.user) + '"></div>' +
     '<div class="field"><label>🔒 MẬT KHẨU</label><input id="in_p" type="password" placeholder="••••••••"></div>' +
     '<button class="btn" id="btn_login"' + (S.loading?' disabled':'') + '>' + (S.loading?'ĐANG XÁC THỰC':'ĐĂNG NHẬP') + '</button>' +
     (S.error ? '<div class="msg err">⚠️ ' + esc(S.error) + '</div>' : '') +
-    '<div class="foot"><b>V9.3 · STUCK + GẤP THẾP</b> · Admin <b>@DENIUS09</b></div>' +
+    '<div class="foot"><b>V10.0 · SAKURA</b> · Admin <b>@DENIUS09</b></div>' +
     '</div></div></div>';
   document.getElementById('btn_login').onclick = doLogin;
   document.getElementById('in_p').onkeydown = e => { if (e.key === 'Enter') doLogin(); };
@@ -1268,7 +1762,7 @@ async function doLogin() {
     S.tab = 'main';
     render();
     startTick();
-    toast('Chào Ông Chủ ' + r.nickname, 'gold');
+    toast('🌸 Chào Ông Chủ ' + r.nickname, 'gold');
   } catch (e) { S.loading = false; S.error = 'Lỗi: ' + e.message; render(); }
 }
 
@@ -1293,7 +1787,7 @@ async function tryResume() {
 function renderInfo() {
   const init = (S.nickname || '?')[0].toUpperCase();
   app.innerHTML =
-    '<div class="screen"><div class="wrap"><div class="card glass">' +
+    '<div class="screen"><div class="wrap"><div class="card glass neon">' +
     '<button class="close-btn" id="btn_close">✕</button>' +
     '<div class="avatar">' + esc(init) + '</div>' +
     '<div class="greet">ようこそ、お兄ちゃん</div>' +
@@ -1301,7 +1795,7 @@ function renderInfo() {
     '<div class="tag">ACCOUNT VERIFIED · MD5</div>' +
     '<div class="stat"><span class="lbl">💰 SỐ DƯ</span><span class="val">' + fmt(S.balance) + 'đ</span></div>' +
     '<div class="stat"><span class="lbl">🔑 TÀI KHOẢN</span><span class="val">' + esc(S.user) + '</span></div>' +
-    '<div class="stat"><span class="lbl">📱 DEVICE</span><span class="val" style="font-size:11px;color:var(--sakura)">' + esc(S.device) + '</span></div>' +
+    '<div class="stat"><span class="lbl">📱 DEVICE</span><span class="val" style="font-size:11px;color:var(--pink-2)">' + esc(S.device) + '</span></div>' +
     '</div></div></div>';
   document.getElementById('btn_close').onclick = () => { S.step = 'base_bet'; render(); };
 }
@@ -1312,15 +1806,15 @@ function renderBaseBet() {
   if (bal > 0) sug = Math.max(1000, Math.min(Math.floor(bal * 0.02 / 1000) * 1000, 100000));
   const val = S.setupBaseBet || sug;
   app.innerHTML =
-    '<div class="screen"><div class="wrap"><div class="card glass">' +
+    '<div class="screen"><div class="wrap"><div class="card glass neon">' +
     '<button class="back-btn" id="btn_back1">← Quay lại</button>' +
     '<div class="step">BƯỚC 1 / 2</div>' +
     '<div class="title">Vốn Cược Mỗi Tay</div>' +
-    '<div class="sub">Số dư: <b style="color:var(--gold)">' + fmt(bal) + 'đ</b> · Bàn <b style="color:var(--cyan)">MD5</b></div>' +
+    '<div class="sub">Số dư: <b style="color:var(--rose)">' + fmt(bal) + 'đ</b> · Bàn <b style="color:var(--pink-2)">MD5</b></div>' +
     '<div class="field"><label>💰 SỐ VỐN (VNĐ)</label><input id="in_base" type="number" inputmode="numeric" value="' + val + '" min="1000" step="1000"></div>' +
     '<button class="btn" id="btn_next1">TIẾP TỤC →</button>' +
     (S.error ? '<div class="msg err">⚠️ ' + esc(S.error) + '</div>' : '') +
-    '<div class="hint">💎 Gấp thếp X2 khi thua (base × 2^bet_streak) · reset khi thắng</div>' +
+    '<div class="hint">💎 Gấp thếp: <code>base × 2^bet_streak</code> · reset khi thắng</div>' +
     '</div></div></div>';
   const inp = document.getElementById('in_base');
   inp.focus(); inp.select();
@@ -1339,15 +1833,26 @@ function renderTarget() {
   if (bal > 0) sug = Math.max(10000, Math.floor(bal * 0.1 / 1000) * 1000 || 100000);
   const val = S.setupTarget || sug;
   app.innerHTML =
-    '<div class="screen"><div class="wrap"><div class="card glass">' +
+    '<div class="screen"><div class="wrap"><div class="card glass neon">' +
     '<button class="back-btn" id="btn_back2">← Quay lại</button>' +
     '<div class="step">BƯỚC 2 / 2</div>' +
     '<div class="title">Mục Tiêu Lợi Nhuận</div>' +
     '<div class="sub">Khi đạt mục tiêu, bot tự dừng.</div>' +
     '<div class="field"><label>🎯 MỤC TIÊU (VNĐ)</label><input id="in_target" type="number" inputmode="numeric" value="' + val + '" min="10000" step="10000"></div>' +
-    '<button class="btn" id="btn_start"' + (S.loading?' disabled':'') + '>' + (S.loading?'ĐANG KHỞI ĐỘNG':'🚀 BẮT ĐẦU AUTO MD5') + '</button>' +
+    '<button class="btn" id="btn_start"' + (S.loading?' disabled':'') + '>' + (S.loading?'ĐANG KHỞI ĐỘNG':'🌸 BẮT ĐẦU AUTO MD5') + '</button>' +
     (S.error ? '<div class="msg err">⚠️ ' + esc(S.error) + '</div>' : '') +
-    '<div class="hint"><b>Công thức DENIUS (MD5):</b><br>A = dice1(prev) + lastDigit(id prev)<br>B = tổng dice phiên (prev − 22)<br>K = |A−B|, final = K−2 nếu B&gt;A<br>final=4 → BỎ TAY · final=5 → theo prev · final&lt;10 → bẻ<br>Bệt + pred bẻ → K parity<br><b>3 tay thua → STUCK theo pred tay 3 (không tính CT) đến khi thắng</b><br><b>Gấp thếp:</b> base × 2^bet_streak</div>' +
+    '<div class="hint"><b>Công thức DENIUS v10:</b><br>' +
+    '• <code>A</code> = dice1(prev) + lastDigit(id prev)<br>' +
+    '• <code>B</code> = <b>dice1</b> của phiên (prev − 22)<br>' +
+    '• <code>B&gt;A</code> → K = B−A, R = K−2<br>' +
+    '• <code>A&gt;B</code> → K = A−B, R = K<br>' +
+    '• <code>A=B</code> → R = 0<br>' +
+    '• <code>R=4</code> → BỎ · <code>R=5</code> → theo prev<br>' +
+    '• <code>R&lt;10</code> → bẻ · <code>R≥10</code> → chẵn XỈU/lẻ TÀI<br>' +
+    '• <code>R âm</code> → abs parity<br>' +
+    '• Bệt + pred ngược → K parity (chẵn TÀI/lẻ XỈU)<br>' +
+    '• 3 tay thua → STUCK theo pred tay 3<br>' +
+    '• Gấp thếp: <code>base × 2^streak</code></div>' +
     '</div></div></div>';
   const inp = document.getElementById('in_target');
   inp.focus(); inp.select();
@@ -1371,7 +1876,7 @@ async function startAuto() {
     S.step = 'main'; S.tab = 'main';
     render();
     startTick();
-    toast('🚀 AUTO MD5 đã bật', 'success');
+    toast('🌸 AUTO MD5 đã bật', 'success');
   } catch (e) { S.loading = false; S.error = 'Lỗi: ' + e.message; render(); }
 }
 
@@ -1388,7 +1893,6 @@ function renderMain() {
   const bs = S.config.bet_streak || 0;
   const mult = Math.pow(2, Math.min(bs, 62));
   const modeText = 'x' + (mult >= 1e9 ? mult.toExponential(1) : mult);
-  const modeColor = 'var(--sakura)';
   const stuckPred = S.config.stuck_pred;
 
   let stuckBadge = '';
@@ -1409,25 +1913,25 @@ function renderMain() {
 
   let wsWarn = '';
   if (S.lastWsError) {
-    wsWarn = '<div class="msg err" style="margin-top:8px;font-size:10px">⚠️ WS: ' + esc(S.lastWsError) + '</div>';
+    wsWarn = '<div class="msg err" style="margin-top:8px;font-size:11px">⚠️ WS: ' + esc(S.lastWsError) + '</div>';
   }
 
   let stuckInfo = '';
   if (stuckPred === 'Tài' || stuckPred === 'Xỉu') {
-    stuckInfo = '<div class="msg stuck" style="margin-top:8px;font-size:10px">🔄 STUCK MODE — Đang theo dự đoán tay thua thứ 3: <b>' + esc(stuckPred) + '</b> (không tính CT). Thắng → quay lại bình thường.</div>';
+    stuckInfo = '<div class="msg stuck" style="margin-top:8px;font-size:11px">🔄 STUCK MODE — Theo dự đoán tay thua thứ 3: <b>' + esc(stuckPred) + '</b>. Thắng → quay lại tính CT.</div>';
   }
 
   app.innerHTML =
     '<div class="screen">' +
     '<div class="header glass">' +
     '<img src="' + LOGO_URL + '" class="hlogo" onerror="this.style.display=\'none\'">' +
-    '<div class="hbrand"><h1>DENIUS</h1><small>MD5 · ' + esc(S.nickname) + '</small></div>' +
+    '<div class="hbrand"><h1>DENIUS</h1><small>🌸 MD5 · ' + esc(S.nickname) + '</small></div>' +
     '<div class="hact">' +
     '<button class="act kill" id="btn_kill" title="Dừng">⏹</button>' +
     '<button class="act logout" id="btn_logout" title="Đăng xuất">⏏</button>' +
     '</div></div>' +
     '<div class="scroll">' +
-    '<div class="bal-card glass"><div class="bal-lbl">💰 SỐ DƯ</div>' +
+    '<div class="bal-card glass"><div class="bal-lbl">SỐ DƯ HIỆN TẠI</div>' +
     '<span class="bal-val" id="bal_val">' + fmt(S.balance) + '</span><span class="bal-suf">đ</span></div>' +
     '<div class="res-card glass">' +
     stuckBadge +
@@ -1438,14 +1942,14 @@ function renderMain() {
     '</div>' +
     '<div class="bet-card glass">' +
     '<div><div class="bet-lbl">SỐ TIỀN CƯỢC</div><div class="bet-val" id="bet_val">' + betTxt + '</div></div>' +
-    '<div class="bet-str"><small>GẤP THẾP</small><b id="mode_val" style="color:' + modeColor + '">' + modeText + '</b></div>' +
+    '<div class="bet-str"><small>GẤP THẾP</small><b id="mode_val">' + modeText + '</b></div>' +
     '</div>' +
     progressCard +
     stuckInfo +
     wsWarn +
     '</div>' +
     '<div class="nav">' +
-    '<button class="nav-btn on" id="nav_main">🎯 Chính</button>' +
+    '<button class="nav-btn on" id="nav_main">🌸 Chính</button>' +
     '<button class="nav-btn" id="nav_hist">📜 Lịch sử</button>' +
     '</div></div>';
 
@@ -1518,7 +2022,7 @@ function renderHistory() {
     '<div class="screen">' +
     '<div class="h-head glass"><div class="h-title">📜 LỊCH SỬ MD5</div><div class="h-count">' + hist.length + ' phiên</div></div>' +
     '<div class="h-scroll" id="hist_list">' + body + '</div>' +
-    '<div class="nav"><button class="nav-btn" id="nav_main2">🎯 Chính</button><button class="nav-btn on" id="nav_hist2">📜 Lịch sử</button></div>' +
+    '<div class="nav"><button class="nav-btn" id="nav_main2">🌸 Chính</button><button class="nav-btn on" id="nav_hist2">📜 Lịch sử</button></div>' +
     '</div>';
   document.getElementById('nav_main2').onclick = () => { S.tab = 'main'; render(); };
   document.getElementById('nav_hist2').onclick = () => { S.tab = 'history'; render(); };
@@ -1576,7 +2080,8 @@ async function tick() {
       if (bv && S.balance !== oldBal) {
         bv.classList.add('upd');
         bv.textContent = fmt(S.balance);
-        setTimeout(() => bv.classList.remove('upd'), 500);
+        sparkleAround(bv);
+        setTimeout(() => bv.classList.remove('upd'), 600);
       }
       const pv = document.getElementById('pred_val');
       if (pv) {
